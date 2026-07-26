@@ -27,15 +27,42 @@ I .huskydg.magisk: System.exit called, status: 0
 **判断** — `dumpsys package io.github.huskydg.magisk | grep versionName`
 返回 `1.0`（完整版应为 `ea3f64a9`）。
 
-**原因** — 装成了 41KB 的 stub 壳。Magisk 守护进程发现
-`/data/adb/magisk/stub.apk` 就优先装它，而壳要联网下载完整版，
+**原因** — 装成了 41KB 的 stub 壳。壳要联网下载完整版，
 Kitsune 上游地址已 404，于是自杀退出。
 
-**修复** — 复制到 `/data/adb/magisk` 时排除 `stub.apk` 和 `magisk.apk`，
-安装用 `pm install -r -d`。
+**修复分两步**（第一步不够，问题会复发）：
+
+1. 复制到 `/data/adb/magisk` 时排除 `stub.apk` 和 `magisk.apk`
+2. **关键** — magiskd 在 `--boot-complete` 阶段如果发现 app 未安装，
+   会**自己拿系统里的 stub.apk 装一个壳**，时机早于 bootanim.rc 里的 `pm install`。
+   所以不能只判断"未安装才装"，还要能识别并覆盖已经装上的壳。
+
+现在用 `install_app.sh` 处理，根据 versionName 判断：
+
+```sh
+ver=$(dumpsys package $PKG | sed -n "s/.*versionName=//p" | head -1)
+case "$ver" in
+    "")  ;;          # 未安装, 装
+    1.0) ;;          # stub 壳, 覆盖
+    *)   exit 0 ;;   # 已是完整版, 不动
+esac
+```
+
+（完整版的 versionName 是 `ea3f64a9`，stub 永远是 `1.0`。
+同时带重试，因为开机初期 `pm` 可能还没就绪。）
+
+**验证**
+```bash
+adb shell dumpsys package io.github.huskydg.magisk | grep versionName
+#   ea3f64a9 = 完整版，1.0 = 壳
+adb shell "echo id | /sbin/su"
+#   uid=0(root) = root 正常
+```
 
 > 注意不是"崩溃"，crash buffer 是空的，是 `System.exit(0)` 正常退出。
 > 看到 crash buffer 为空但进程消失，要往"主动退出"方向想。
+>
+> 另：`su` 命令超时无响应也是这个问题的表现之一（壳没有完整的授权界面）。
 
 ---
 

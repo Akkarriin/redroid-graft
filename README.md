@@ -67,6 +67,8 @@ adb -s $D shell dumpsys SurfaceFlinger | grep GLES
 adb -s $D shell getprop ro.hardware.gralloc      # minigbm_gbm_mesa
 adb -s $D shell getprop ro.dalvik.vm.native.bridge  # libhoudini.so
 adb -s $D shell grep -c arm64 /linkerconfig/ld.config.txt  # >0
+adb -s $D shell "echo id | /sbin/su"            # uid=0(root)
+adb -s $D shell dumpsys package io.github.huskydg.magisk | grep versionName  # 非 1.0
 adb -s $D exec-out screencap -p > /tmp/s.png    # 有画面
 adb -s $D shell screenrecord --time-limit 3 /data/local/tmp/t.mp4  # 编码器正常
 ```

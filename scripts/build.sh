@@ -155,6 +155,34 @@ for f in main.jar module_installer.sh uninstaller.sh bootctl; do
     [ -f "$ASSETS/$f" ] && install -Dm755 "$ASSETS/$f" "$MGDIR/$f"
 done
 
+# magiskd 在 --boot-complete 时, 如果发现 app 未安装,
+# 会自己拿 stub.apk 装一个 41KB 的壳(versionName=1.0)。
+# 那个壳启动后要联网下载完整版, 而 Kitsune 上游地址已 404,
+# 于是 System.exit(0) 自杀 —— 表现为“点开就闪退”。
+# 所以这里不能只判断“未安装才装”, 还要把已经装上的壳覆盖掉。
+{
+    echo '#!/system/bin/sh'
+    echo '# 安装完整版 Magisk app; 若已装的是 stub 壳则强制覆盖'
+    echo 'APK=/system/etc/init/magisk/magisk.apk'
+    echo "PKG=$MAGISK_PKG"
+    echo ''
+    echo 'ver=$(dumpsys package $PKG 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
+    echo 'case "$ver" in'
+    echo '    "")  ;;          # 未安装, 装'
+    echo '    1.0) ;;          # stub 壳, 覆盖'
+    echo '    *)   exit 0 ;;   # 已是完整版, 不动'
+    echo 'esac'
+    echo ''
+    echo '# pm 在开机初期可能还没就绪, 重试几次'
+    echo 'i=0'
+    echo 'while [ $i -lt 10 ]; do'
+    echo '    pm install -r -d "$APK" >/dev/null 2>&1 && exit 0'
+    echo '    i=$((i+1)); sleep 3'
+    echo 'done'
+    echo 'exit 1'
+} > "$MGDIR/install_app.sh"
+chmod 0755 "$MGDIR/install_app.sh"
+
 
 MAGISKSYSTEMDIR=/system/etc/init/magisk
 MAGISKTMP=/sbin
@@ -186,7 +214,7 @@ on property:vold.decrypt=trigger_restart_framework
 on property:sys.boot_completed=1
     mkdir /data/adb/magisk 755
     exec u:r:su:s0 root root -- $MAGISKTMP/magisk --auto-selinux --boot-complete
-    exec -- /system/bin/sh -c "if [ ! -e /data/data/$MAGISK_PKG ] ; then pm install -r -d $MAGISKSYSTEMDIR/magisk.apk ; fi"
+    exec -- /system/bin/sh -c "$MAGISKSYSTEMDIR/install_app.sh"
 
 on property:init.svc.zygote=restarting
     exec u:r:su:s0 root root -- $MAGISKTMP/magisk --auto-selinux --zygote-restart
