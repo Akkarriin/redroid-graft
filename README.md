@@ -106,16 +106,32 @@ adb -s $D shell screenrecord --time-limit 3 /data/local/tmp/t.mp4  # 编码器�
 
 没有 ashmem 的新内核要加 `androidboot.use_memfd=1`（多数情况都需要）。
 
-### 换 GPU 厂商
+### GPU 支持
 
-`gralloc4.sh` 里 Vulkan 驱动是变量：
+**不需要为不同显卡分别构建。** 镜像内置了各厂商驱动，开机自动选：
+
+- **GL/GLES** — `libgallium_dri.so` 是 megadriver，一个文件内含
+  radeonsi / iris / nouveau / zink / llvmpipe 等所有驱动，天然通用
+- **Vulkan** — 分文件，所以全部打包（+50MB），
+  `/vendor/bin/detect_gpu.sh` 在 early-init 读 `/sys/class/drm/renderD*/device/uevent`
+  的内核驱动名自动选择
+
+| 内核驱动 | Vulkan HAL | 状态 |
+|---|---|---|
+| `i915` / `xe` | `vulkan.intel` | 实测通过（Arc A380） |
+| `amdgpu` | `vulkan.radeon` | 未实测 |
+| `virtio_gpu` | `vulkan.virtio` | 未实测 |
+| 其他 | `vulkan.lvp` | 软件渲染回退 |
+
+需要时可用启动参数手动指定（优先于自动检测）：
 
 ```bash
-VK_DRIVERS="vulkan.radeon.so" ./scripts/gralloc4.sh          # AMD
-VK_DRIVERS="vulkan.nouveau.so" ./scripts/gralloc4.sh         # NVIDIA(nouveau)
+docker run ... redroid-graft:13.0.0 ro.hardware.vulkan=radeon
 ```
 
-同时把 `ro.hardware.vulkan` 改成 `radeon` / `nouveau`（脚本内 `props` 字典）。
+> **NVIDIA 暂不可用**。Waydroid 镜像里没有 Mesa 26 的 nouveau/nvk驱动；
+> redroid 自带的 `vulkan.nouveau.so` 是旧 Mesa 24，与 gralloc4 不兼容，
+> 选中会崩溃，所以检测脚本故意不映射它，会回退到软件渲染。
 
 ## 文档
 
@@ -150,8 +166,9 @@ NEW_IMAGE=myrepo/android:13 ./scripts/gralloc4.sh
 
 ## 已知限制
 
-- **只在 Intel Arc A380 + xe 驱动上实测过**。其他 GPU 理论可行但未验证。
-- 镜像约 2.5 GB（Mesa 26 的 LLVM 后端 64/32 位各一份就占了 220 MB）。
+- **只在 Intel Arc A380 + xe 驱动上实测过**。AMD 的驱动已打包且检测逻辑已就位，
+  但没有实机验证；NVIDIA 因缺少 Mesa 26 的 nouveau 驱动暂不可用（会回退软件渲染）。
+- 镜像约 2.6 GB（Mesa 26 的 LLVM 后端 64/32 位各一份占 220 MB，全厂商 Vulkan 驱动占 50 MB）。
 - 基于 redroid 13。更高版本 redroid 的 vendor 分区布局相同，
   理论上改 `BASE_IMAGE` 即可，但 houdini 的 linker 补丁需要对应版本
   （`rote66/redroid_libhoudini_hack` 提供 9.0 ~ 15.0）。

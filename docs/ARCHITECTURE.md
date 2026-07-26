@@ -191,6 +191,42 @@ vendor/build.prop:  ro.hardware.gralloc=minigbm_gbm_mesa
 mapper 是 **passthrough** 模式（在调用方进程内 dlopen，不走 binder），
 所以 32 位进程必须有 32 位实现——这是最容易漏的一点。
 
+### GPU 厂商无关性
+
+搬运的组件里只有 Vulkan HAL 是分厂商的：
+
+| 组件 | 厂商相关？ |
+|---|---|
+| gralloc4 / minigbm | 否 |
+| `libgallium_dri.so` | **否** — megadriver，41MB 里含 radeonsi/iris/nouveau/zink/llvmpipe... |
+| `libLLVM22.so` | 否 |
+| EGL / GLES | 否 |
+| `libdrm_{intel,amdgpu,radeon}.so` | 三个都已打包 |
+| `vulkan.*.so` | **是** — 分文件 |
+
+所以把 Waydroid 有的 Vulkan 驱动全部打包（intel / intel_hasvk / radeon / lvp / virtio，
+约 +50MB），开机时由 `/vendor/bin/detect_gpu.sh` 在 `early-init` 阶段自动选：
+
+```sh
+drv=$(sed -n 's/^DRIVER=//p' /sys/class/drm/renderD*/device/uevent | head -1)
+case "$drv" in
+    i915|xe)    vk=intel ;;
+    amdgpu)     vk=radeon ;;
+    virtio_gpu) vk=virtio ;;
+    *)          vk=lvp ;;
+esac
+setprop ro.hardware.vulkan "$vk"
+```
+
+两个设计细节：
+
+- 开头先查 `getprop ro.hardware.vulkan`，**非空则直接退出** ——
+  让启动参数 `ro.hardware.vulkan=xxx` 能覆盖自动检测
+  （redroid 打了 `allow override ro.* prop` 补丁，内核 cmdline 里的 `ro.*` 会被写入）
+- **故意不映射 nouveau**。镜像里确实有 `vulkan.nouveau.so`，
+  但那是 redroid 自带的旧 Mesa 24（Waydroid 没有 nouveau 可搬），
+  与 gralloc4 不兼容，选中反而会崩。宁可回退到 `lvp` 软件渲染。
+
 ### 依赖闭包
 
 脚本末尾会做一次校验：遍历所有新增 `.so` 的 `DT_NEEDED`，
