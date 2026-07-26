@@ -30,26 +30,48 @@ I .huskydg.magisk: System.exit called, status: 0
 **原因** — 装成了 41KB 的 stub 壳。壳要联网下载完整版，
 Kitsune 上游地址已 404，于是自杀退出。
 
-**修复分两步**（第一步不够，问题会复发）：
+**这个问题修了三次**，前两次都没看到真正的因果，值得记下来：
 
-1. 复制到 `/data/adb/magisk` 时排除 `stub.apk` 和 `magisk.apk`
-2. **关键** — magiskd 在 `--boot-complete` 阶段如果发现 app 未安装，
-   会**自己拿系统里的 stub.apk 装一个壳**，时机早于 bootanim.rc 里的 `pm install`。
-   所以不能只判断"未安装才装"，还要能识别并覆盖已经装上的壳。
+**第一版**：复制到 `/data/adb/magisk` 时排除 `stub.apk`。
+→ 无效，因为装壳的根本不是那条路径。
 
-现在用 `install_app.sh` 处理，根据 versionName 判断：
+**第二版**：用 `install_app.sh` 按 versionName 判断，识别到 `1.0` 就覆盖。
+→ 手动跑能修好，但开机时依旧是壳。
 
-```sh
-ver=$(dumpsys package $PKG | sed -n "s/.*versionName=//p" | head -1)
-case "$ver" in
-    "")  ;;          # 未安装, 装
-    1.0) ;;          # stub 壳, 覆盖
-    *)   exit 0 ;;   # 已是完整版, 不动
-esac
+**真正的原因是时序**。看日志：
+
+```
+22:28:49  I Magisk : pm_install: /data/stub.apk     ← magiskd 自己装的
+22:28:50  I Magisk : pm_install: Success
 ```
 
-（完整版的 versionName 是 `ea3f64a9`，stub 永远是 `1.0`。
-同时带重试，因为开机初期 `pm` 可能还没就绪。）
+magiskd 在它自己的时机 `pm_install /data/stub.apk`，
+**而且这个时机可能在 bootanim.rc 的 `install_app.sh` 之后**。
+只检查一次的脚本：开机时看到"未安装"→装了完整版→随后被 magiskd 覆盖回 stub。
+
+**最终方案**：后台持续监视两分钟，发现壳就盖回来：
+
+```sh
+i=0
+while [ $i -lt 60 ]; do
+    ver=$(dumpsys package $PKG 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)
+    case "$ver" in
+        ""|1.0) pm install -r -d "$APK" >/dev/null 2>&1 ;;
+    esac
+    i=$((i+1)); sleep 2
+done
+```
+
+配合 init.rc 的 `exec_background`（不阻塞开机流程）。
+
+（完整版 versionName 是 `ea3f64a9`，stub 永远是 `1.0`，可靠区分。）
+
+**实测验证**：手动装上 stub 后，8 秒内被监视脚本自动覆盖回完整版。
+
+> 教训：对于"有另一个守护进程也在操作同一资源"的情况，
+> 一次性检查不够。要么找到它的触发点精确插入，要么就持续监视。
+> 先前两次失败都是因为只看到"现象消失了"就以为修好了，
+> 没验证它会不会被重新触发。
 
 **验证**
 ```bash

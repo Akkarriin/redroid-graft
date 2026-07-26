@@ -88,8 +88,9 @@ system/etc/init/bootanim.rc     ← 借 bootanim 服务启动 magisk
 2. **stub 壳问题**（详见 TROUBLESHOOTING.md #1）。magiskd 在 `--boot-complete`
    发现 app 未安装时，会自己拿 `stub.apk` 装个 41KB 的壳（versionName=1.0），
    而壳要联网下载完整版，Kitsune 上游地址已 404 → `System.exit(0)` 自杀。
-   处理方式：`/data/adb/magisk` 不放 apk，并用 `install_app.sh`
-   根据 versionName 判断，识别到壳（1.0）就强制覆盖成完整版
+   关键是 **magiskd 装壳的时机可能晚于 bootanim.rc**，所以一次性检查会被覆盖。
+   处理方式：`install_app.sh` 用 `exec_background` 后台持续监视两分钟，
+   每 2 秒查一次 versionName，发现是 `1.0`（壳）或未安装就重装完整版
 
 ### props.tar — 属性
 

@@ -163,26 +163,31 @@ done
 # 那个壳启动后要联网下载完整版, 而 Kitsune 上游地址已 404,
 # 于是 System.exit(0) 自杀 —— 表现为“点开就闪退”。
 # 所以这里不能只判断“未安装才装”, 还要把已经装上的壳覆盖掉。
+# 注意时序: magiskd 在它自己的时机 pm_install /data/stub.apk,
+# 可能发生在本脚本之后 —— 只跑一次会被它覆盖回去。
+# 所以后台持续监视一段时间, 发现壳就盖回来。
 {
     echo '#!/system/bin/sh'
-    echo '# 安装完整版 Magisk app; 若已装的是 stub 壳则强制覆盖'
+    echo '# 确保装的是完整版 Magisk app 而不是 stub 壳'
+    echo '#'
+    echo '# magiskd 在 --boot-complete 后会自己 pm_install /data/stub.apk,'
+    echo '# 时机不确定(可能在本脚本之后), 壳启动后要联网下载完整版而上游 404,'
+    echo '# 于是 System.exit(0) —— 表现为“点开就闪退”。'
+    echo '# 故持续监视而非只检查一次。'
     echo 'APK=/system/etc/init/magisk/magisk.apk'
     echo "PKG=$MAGISK_PKG"
     echo ''
-    echo 'ver=$(dumpsys package $PKG 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
-    echo 'case "$ver" in'
-    echo '    "")  ;;          # 未安装, 装'
-    echo '    1.0) ;;          # stub 壳, 覆盖'
-    echo '    *)   exit 0 ;;   # 已是完整版, 不动'
-    echo 'esac'
-    echo ''
-    echo '# pm 在开机初期可能还没就绪, 重试几次'
     echo 'i=0'
-    echo 'while [ $i -lt 10 ]; do'
-    echo '    pm install -r -d "$APK" >/dev/null 2>&1 && exit 0'
-    echo '    i=$((i+1)); sleep 3'
+    echo 'while [ $i -lt 60 ]; do'
+    echo '    ver=$(dumpsys package $PKG 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
+    echo '    case "$ver" in'
+    echo '        ""|1.0)'
+    echo '            # 未安装或是 stub 壳 -> 装/覆盖完整版'
+    echo '            pm install -r -d "$APK" >/dev/null 2>&1'
+    echo '            ;;'
+    echo '    esac'
+    echo '    i=$((i+1)); sleep 2'
     echo 'done'
-    echo 'exit 1'
 } > "$MGDIR/install_app.sh"
 chmod 0755 "$MGDIR/install_app.sh"
 
@@ -217,7 +222,7 @@ on property:vold.decrypt=trigger_restart_framework
 on property:sys.boot_completed=1
     mkdir /data/adb/magisk 755
     exec u:r:su:s0 root root -- $MAGISKTMP/magisk --auto-selinux --boot-complete
-    exec -- /system/bin/sh -c "$MAGISKSYSTEMDIR/install_app.sh"
+    exec_background -- /system/bin/sh -c "$MAGISKSYSTEMDIR/install_app.sh"
 
 on property:init.svc.zygote=restarting
     exec u:r:su:s0 root root -- $MAGISKTMP/magisk --auto-selinux --zygote-restart
