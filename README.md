@@ -1,8 +1,13 @@
-# redroid-gaming
+# redroid-graft
 
-给 [redroid](https://github.com/remote-android/redroid-doc) 加上 **ARM 翻译**、**Root** 和 **完整 Vulkan 支持**的构建脚本。
+把 [Waydroid](https://github.com/waydroid/waydroid) 的现代图形栈**嫁接**到
+[redroid](https://github.com/remote-android/redroid-doc) 上，再加上 ARM 翻译和 Root。
 
 面向的场景：在 Linux 服务器 / NAS 上用 Docker 多开 Android 实例挂机手游，用 scrcpy 看画面。
+
+> 名字里的 *graft*（嫁接）就是这个项目的方法论：
+> redroid 的容器化骨架 + Waydroid 的 gralloc4/Mesa 26 图形栈，
+> 两者同为 Android 13 / x86_64，ABI 兼容，直接搬运二进制即可。
 
 ## 解决了什么
 
@@ -22,6 +27,17 @@ Vulkan 应用拿不到 swapchain buffer。本项目把 Waydroid（LineageOS 20�
 实测环境：Ubuntu + Intel Arc A380（xe 驱动），少女前线2（Unity 2019.4 IL2CPP，Vulkan-only）、
 赛马娘均可正常运行。
 
+### 为什么不直接用 Waydroid
+
+Waydroid 本身就有完整的 gralloc4 + Vulkan，桌面上跑游戏没问题。但：
+
+- **硬编码单实例** —— 固定 `/var/lib/waydroid`、固定 LXC 容器名、
+  独占 D-Bus 名 `id.waydro.Container`，多开需要改造 Waydroid 本身
+- **强依赖 Wayland compositor** —— 无头服务器上还要再套 headless weston
+
+而 redroid 天生无头、多开、adb 直连，正好相反。
+所以选择保留 redroid 的骨架，只把 Waydroid 的图形栈嫁接过来。
+
 ## 快速开始
 
 依赖：`podman` 或 `docker`、`curl`、`unzip`、`e2fsprogs`（提供 `debugfs`）、`python3`。
@@ -32,8 +48,14 @@ Vulkan 应用拿不到 swapchain buffer。本项目把 Waydroid（LineageOS 20�
 
 # 2. 图形层：gralloc4 + Mesa 26 + Vulkan
 ./scripts/gralloc4.sh
-# 产出 localhost/redroid:13.0.0-gaming
 ```
+
+产出两个镜像：
+
+| 镜像 | 内容 |
+|---|---|
+| `redroid-graft:13.0.0-houdini-magisk` | 中间层，houdini + Magisk，没有图形栈改造 |
+| `redroid-graft:13.0.0` | **最终镜像**，含完整 gralloc4 + Mesa 26 |
 
 两个脚本都会缓存下载内容到 `dl/`，重跑不会重复下载（共约 350 MB）。
 用 `CTR=docker` 切换容器引擎。
@@ -45,7 +67,7 @@ docker run -itd --privileged \
     --name android-1 \
     -v ~/redroid-data/1:/data \
     -p 5555:5555 \
-    redroid:13-gaming \
+    redroid-graft:13.0.0 \
     androidboot.use_memfd=1 \
     androidboot.redroid_fps=60 \
     androidboot.redroid_width=1080 \
@@ -102,8 +124,11 @@ VK_DRIVERS="vulkan.nouveau.so" ./scripts/gralloc4.sh         # NVIDIA(nouveau)
 
 ## 致谢
 
-- [remote-android/redroid](https://github.com/remote-android/redroid-doc) — 基础镜像
-- [Waydroid](https://github.com/waydroid/waydroid) — gralloc4 / minigbm / Mesa 26 图形栈来源
+本项目本质上只是把别人做好的东西接到一起，真正的工作在上游：
+
+- [Waydroid](https://github.com/waydroid/waydroid) — **gralloc4 / minigbm_gbm_mesa / Mesa 26
+  整套图形栈都是他们做的**，包括专为 Mesa 适配的 gralloc 实现
+- [remote-android/redroid](https://github.com/remote-android/redroid-doc) — 容器化 Android 基础镜像
 - [waydroid-helper/extensions](https://github.com/waydroid-helper/extensions) — houdini / Magisk 配方
 - [rote66/redroid_libhoudini_hack](https://github.com/rote66/redroid_libhoudini_hack) — linker 补丁
 - [supremegamers](https://github.com/supremegamers) — libhoudini 二进制

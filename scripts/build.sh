@@ -46,7 +46,10 @@ case "$ROOT" in
         echo "ROOT 只支持 kitsune 或 magisk"; exit 1 ;;
 esac
 
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid:13.0.0-houdini-${ROOT}}"
+# 默认(Kitsune) tag 不带后缀; 换官方 Magisk 时加上以示区分
+_root_suffix=""
+[ "$ROOT" = magisk ] && _root_suffix="-official"
+NEW_IMAGE="${NEW_IMAGE:-localhost/redroid-graft:13.0.0-houdini-magisk${_root_suffix}}"
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 

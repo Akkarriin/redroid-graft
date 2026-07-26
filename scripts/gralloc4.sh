@@ -18,8 +18,8 @@ WD_VENDOR_ZIP="$DL/waydroid-vendor.zip"
 
 # 基底镜像: 必须是已注入 houdini 的那个,
 # 否则下面取 build.prop 会拿到原版值, 把 native bridge 设置冲掉
-BASE_IMAGE="${BASE_IMAGE:-localhost/redroid:13.0.0-houdini-kitsune}"
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid:13.0.0-gaming}"
+BASE_IMAGE="${BASE_IMAGE:-localhost/redroid-graft:13.0.0-houdini-magisk}"
+NEW_IMAGE="${NEW_IMAGE:-localhost/redroid-graft:13.0.0}"
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 
