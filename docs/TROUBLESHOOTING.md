@@ -287,13 +287,99 @@ adb shell getprop ro.dalvik.vm.native.bridge
 # libnb.so      ← 应该是 libhoudini.so
 ```
 
-**根因** — `gralloc4.sh` 生成 `vendor/build.prop` 时从**原版 redroid** 取模板，
+**根因（旧构建顺序）** — 当时是先叠 houdini 再叠 gralloc4，
+`gralloc4.sh` 生成 `vendor/build.prop` 时从**原版 redroid** 取模板，
 把 houdini 层改好的属性覆盖回了默认值。
 
-**修复** — 改为从 houdini 层镜像取（`BASE_IMAGE` 变量）。
+**现行修复** — 构建顺序改为先 `gralloc4.sh` 再 `build.sh`：
+图形栈底图先就位；`build.sh` 只 patch native bridge 相关键，
+保留 `ro.hardware.gralloc` / `ro.hardware.egl`。
 
 > 多层叠加时，**后层的同名文件会完全覆盖前层**。
-> 凡是要改配置文件的层，模板必须从直接上一层取，不能从原始镜像取。
+> 凡是要改配置文件的层，模板必须从直接上一层取，不能从原始镜像取；
+> 能只改键就不要整文件重写。
+
+---
+
+## 7. 进系统设置 → 整屏崩（allocator@4 SIGSEGV）
+
+**现象** — 桌面/截屏正常，一点「设置」子页（应用列表、显示等）就黑屏或重启 UI。
+
+**日志**
+```
+F libc: Fatal signal 11 (SIGSEGV) ... allocator@4.0-service.minigbm_gbm_mesa
+  #?? dri2_map_image / dri_flush   ← libgallium_dri.so
+  #?? gbm_mesa_alloc              ← libgbm_mesa_wrapper.so
+  #?? gbm_mesa_bo_create          ← libminigbm_gralloc_gbm_mesa.so
+```
+
+分配成功时也能看到：
+```
+V [minigbm:gbm_mesa_internals.cpp]: Allocated: 1080x1920, stride: 4352, map_stride: 0
+```
+`map_stride: 0` 表示没走（或没走完）SW 探测；崩的往往是带 `BO_USE_SW_MASK` 的那批。
+
+**原因** — Settings 等 UI 会申请带 `BO_USE_SW_MASK` 的 buffer。
+`gbm_mesa_alloc` 为了探测 `map_stride`，会在分配后再 `gbm_bo_import` + `gbm_bo_map` + `unmap`。
+在 Intel Arc + `xe` 上，这条 map/flush 路径会空指针崩；
+allocator 的 init 里有 `onrestart restart surfaceflinger`，于是把整桌面拖死。
+
+**不是这些问题**（当时都试过）：
+
+| 怀疑 | 实测 |
+|---|---|
+| 多实例抢同一块 GPU | 停掉其它 redroid 后**照样崩** |
+| 打包了全厂商 Vulkan / `detect_gpu` | 退回 Intel-only **照样崩** |
+| redroid-xe 的 minigbm 二进制补丁<br>（`patch-minigbm-bo-import` / `formats`） | bind-mount 后仍崩（有时变成 Scudo abort，本质还在 Mesa map 路径） |
+| 退回 `gralloc=gbm` + Mesa 24 | Settings 是稳了，但 **Vulkan 游戏不可用**，不能接受 |
+
+对照：未嫁接 gralloc4 的旧实例能进设置（`ro.hardware.gralloc=gbm`，Mesa 24）。
+
+**修复** — SW buffer 已 `force_linear`，`map_stride == stride`，不必真去 map。
+`scripts/patch-gbm-mesa-skip-map-stride.py` 在 `gralloc4.sh` 里改掉
+`libgbm_mesa_wrapper.so`：跳过探测，直接 `out_map_stride = out_stride`。
+**不回退 gralloc4 / Mesa 26 / Vulkan。**
+
+**验证**
+```bash
+adb shell am start -a android.settings.APPLICATION_SETTINGS
+# crash buffer 不应再有 allocator@4
+adb logcat -d -b crash | grep allocator@4   # 空
+adb shell "ps -A | grep allocator@4"        # 仍在
+# 分配日志里 map_stride 应等于 stride（不再是 0）
+adb logcat -d | grep 'Allocated:'
+#   Allocated: 1080x1920, stride: 4352, map_stride: 4352
+```
+
+---
+
+## 8. 游戏到底有没有走 Vulkan？
+
+**现象** — 画面能出来，但不确定是 GLES 还是 Vulkan
+（尤其是少女前线2 这种 Vulkan-only Unity）。
+
+**不要看** `dumpsys gfxinfo` 里的 `Pipeline=Skia (OpenGL)` ——
+那是 Android 控件层（状态栏/View），不是 Unity SurfaceView 主渲染。
+
+**要看** `dumpsys gpu`：
+
+```bash
+adb shell dumpsys gpu | grep -A20 'appPackageName = com.Sunborn.SnqxExilium'
+#   vkDriverLoadingTime: <非空数字>   ← 已加载 Vulkan 驱动
+#   cpuVulkanInUse = 0                ← 走 GPU，不是 CPU Vulkan
+#
+adb shell dumpsys gpu | head -20
+#   vkLoadingCount = 1                ← 有进程成功加载过
+#   vkLoadingFailureCount = 0
+```
+
+**失败时的老特征**（嫁接不完整时会出现）：
+```
+E Unity: Desired shader compiler platform 5 is not available
+E vulkan: dequeueBuffer failed: Invalid argument (-22)
+I Gralloc4: mapper 4.x is not supported
+D vulkan: vkCreateImage w/ native buffer failed
+```
 
 ---
 
@@ -326,6 +412,16 @@ Waydroid 的 gralloc4 确实是现成的，但它是**硬编码单实例**架构
 headless weston。对"多开 + scrcpy + 无头"的场景，redroid 才是对的，
 只是需要把 Waydroid 的图形栈搬过来。
 
+**为修 Settings 而退回未嫁接的旧图形栈（Mesa 24 + `gralloc=gbm`）** — 禁止。
+Settings 是稳了，Vulkan-only 游戏会黑屏/崩。正确做法是保留 gralloc4，
+打 `patch-gbm-mesa-skip-map-stride.py`（见 §7）。
+
+**以为 Settings 崩是「多厂商 Vulkan / detect_gpu」引起的** — 误判。
+Intel-only 硬编码后照样崩；根因是 allocate 时的 `gbm_bo_map` 探测（§7）。
+
+**只 bind-mount redroid-xe 的 patched minigbm** — 治不好 Settings。
+那两处补丁针对 SW import / Unity 格式探测，不绕开 wrapper 里的 map_stride 探测。
+
 ---
 
 ## 排查思路小结
@@ -340,3 +436,6 @@ headless weston。对"多开 + scrcpy + 无头"的场景，redroid 才是对的�
    是确认"新组件是否真的生效"的可靠手段。
 6. **用最快的命令复现** — `screenrecord` 比开 scrcpy 快，
    `screencap` 比看画面快，`getprop` 比翻日志快。
+7. **游戏是否 Vulkan 看 `dumpsys gpu`，别看 gfxinfo 的 Skia 行**（见 §8）。
+8. **「能进设置」的旧容器未必带 Vulkan** — 先 `getprop ro.hardware.gralloc`
+   区分 `gbm`（旧）和 `minigbm_gbm_mesa`（嫁接）。

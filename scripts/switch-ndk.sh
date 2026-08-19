@@ -12,12 +12,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC="$HERE/../src/ndk"
-OUT="$HERE/../out"
+SRC="$HERE/src/ndk-stock"
+OUT="$HERE/out"
 CTR=${CTR:-podman}
 
-BASE_IMAGE="${BASE_IMAGE:-localhost/redroid-graft:13.0.0}"
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid-graft:13.0.0-ndk}"
+BASE_IMAGE="${BASE_IMAGE:-localhost/redroid13-graft-houdini-magisk:latest}"
+NEW_IMAGE="${NEW_IMAGE:-localhost/redroid13-graft-ndk:latest}"
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 

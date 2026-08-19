@@ -16,10 +16,9 @@ CTR=${CTR:-podman}
 WD_VENDOR_URL="https://sourceforge.net/projects/waydroid/files/images/vendor/waydroid_x86_64/lineage-20.0-20260428-MAINLINE-waydroid_x86_64-vendor.zip/download"
 WD_VENDOR_ZIP="$DL/waydroid-vendor.zip"
 
-# 基底镜像: 必须是已注入 houdini 的那个,
-# 否则下面取 build.prop 会拿到原版值, 把 native bridge 设置冲掉
-BASE_IMAGE="${BASE_IMAGE:-localhost/redroid-graft:13.0.0-houdini-magisk}"
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid-graft:13.0.0}"
+# 先打图形栈底图; houdini/Magisk 由 build.sh 叠在这之上
+BASE_IMAGE="${BASE_IMAGE:-docker.io/redroid/redroid:13.0.0-latest}"
+NEW_IMAGE="${NEW_IMAGE:-localhost/redroid13-graft:latest}"
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 
@@ -77,15 +76,13 @@ for l in libEGL_mesa.so libGLESv1_CM_mesa.so libGLESv2_mesa.so; do
     ex "lib64/egl/$l" "$SRC/vendor/lib64/egl/$l"
 done
 
-# Vulkan HAL 也必须是 Mesa 26 的:
-# redroid 自带 Mesa 24 的 vulkan.*.so 不认识 gralloc4 分配的 buffer,
+# Vulkan HAL 也必须是 Mesa 26 的 ANV:
+# redroid 自带 Mesa 24 的 vulkan.intel.so 不认识 gralloc4 分配的 buffer,
 # 导致 "vkCreateImage w/ native buffer failed" → GetSwapchainImagesKHR 空指针崩溃。
-#
-# GL 侧的 libgallium_dri.so 是 megadriver(一个文件含 radeonsi/iris/nouveau/zink...),
-# 但 Vulkan 是分文件的, 所以全部打包(约 +50MB), 开机时自动选
-# 注: Waydroid 镜像里只有这几个。redroid 自带的 vulkan.nouveau/broadcom/freedreno
-# 是旧 Mesa 24, 与 gralloc4 不兼容, 所以 detect_gpu.sh 里用白名单避开它们
-VK_DRIVERS="${VK_DRIVERS:-vulkan.intel.so vulkan.intel_hasvk.so vulkan.radeon.so vulkan.lvp.so vulkan.virtio.so}"
+# 只带 intel(Arc/核显)。曾打包全厂商驱动 + detect_gpu 自动选；
+# Settings 崩后来证实与此无关（见 TROUBLESHOOTING §7 的 map_stride 补丁），
+# 现保持 Intel-only 以减小面。
+VK_DRIVERS="${VK_DRIVERS:-vulkan.intel.so vulkan.intel_hasvk.so}"
 for l in $VK_DRIVERS; do
     ex "lib64/hw/$l" "$SRC/vendor/lib64/hw/$l"
 done
@@ -118,6 +115,21 @@ done
 chmod 0755 "$SRC/vendor/bin/hw/"* 
 chmod 0644 "$SRC/vendor/lib64/"*.so "$SRC/vendor/lib64/hw/"*.so "$SRC/vendor/lib64/egl/"*.so \
            "$SRC/vendor/lib/"*.so "$SRC/vendor/lib/hw/"*.so "$SRC/vendor/lib/egl/"*.so
+
+########################################
+# Arc/xe: 跳过 allocate 时的 gbm_bo_map 探测 map_stride
+# Settings 等带 BO_USE_SW_MASK 的分配会走 import+map+unmap → Mesa dri_flush SIGSEGV。
+# SW buffer 已 force_linear, map_stride == stride, 直接抄 out_stride 即可。
+########################################
+msg "打补丁: 跳过 gbm_mesa_alloc 的 map_stride 探测 (xe)"
+python3 "$HERE/patch-gbm-mesa-skip-map-stride.py" \
+    "$SRC/vendor/lib64/libgbm_mesa_wrapper.so"
+# 32 位若签名不同则跳过 (allocator@4 是 64 位服务)
+if [ -f "$SRC/vendor/lib/libgbm_mesa_wrapper.so" ]; then
+    python3 "$HERE/patch-gbm-mesa-skip-map-stride.py" \
+        "$SRC/vendor/lib/libgbm_mesa_wrapper.so" || \
+        msg "32 位 wrapper 签名不匹配, 跳过 (allocator 为 64 位)"
+fi
 
 ########################################
 # VINTF: 声明 allocator@4.0 / mapper@4.0
@@ -169,47 +181,7 @@ service vendor.graphics.allocator-4-0 /vendor/bin/hw/android.hardware.graphics.a
 
 on early-init
     stop vendor.gralloc-2-0
-    exec -- /vendor/bin/detect_gpu.sh
 EOF
-
-########################################
-# GPU 自动检测
-# 镜像内置了所有厂商的 Vulkan 驱动, 开机时根据 DRM 内核驱动名选一个。
-# 映射表参考 Waydroid tools/helpers/gpu.py。
-# 启动参数里手动指定 ro.hardware.vulkan=xxx 可覆盖自动检测。
-########################################
-mkdir -p "$SRC/vendor/bin"
-cat > "$SRC/vendor/bin/detect_gpu.sh" <<'EOF'
-#!/vendor/bin/sh
-# 根据 /dev/dri 的内核驱动选择 Vulkan HAL
-
-# 已由启动参数指定则不覆盖
-[ -n "$(getprop ro.hardware.vulkan)" ] && exit 0
-
-drv=""
-for n in /sys/class/drm/renderD*; do
-    [ -e "$n/device/uevent" ] || continue
-    drv=$(sed -n 's/^DRIVER=//p' "$n/device/uevent" | head -1)
-    [ -n "$drv" ] && break
-done
-
-# 只映射到 Mesa 26 的驱动。
-# 镜像里还有 redroid 自带的 vulkan.nouveau/broadcom/freedreno,
-# 但那些是旧 Mesa 24, 不认识 gralloc4 的 buffer, 选中会崩溃 —— 故不映射
-case "$drv" in
-    i915|xe)    vk=intel ;;
-    amdgpu)     vk=radeon ;;
-    virtio_gpu) vk=virtio ;;
-    *)          vk=lvp ;;     # 包括 nouveau 等: 没有 Mesa 26 驱动, 走软件渲染
-esac
-
-# 双保险: 文件不存在就回退
-[ -f "/vendor/lib64/hw/vulkan.$vk.so" ] || vk=lvp
-
-setprop ro.hardware.vulkan "$vk"
-log -t detect_gpu "drm driver=$drv -> vulkan=$vk"
-EOF
-chmod 0755 "$SRC/vendor/bin/detect_gpu.sh"
 
 # 覆盖原 2.0 服务定义, 加 disabled 使其不自动启动
 cat > "$SRC/vendor/etc/init/android.hardware.graphics.allocator@2.0-service.rc" <<'EOF'
@@ -259,11 +231,9 @@ $CTR rm "$CID" >/dev/null
 python3 - "$SRC/props/build.prop" <<'PYEOF'
 import re, sys
 p = sys.argv[1]
-# 注: 不在这里写 ro.hardware.vulkan
-# 它由 /vendor/bin/detect_gpu.sh 在 early-init 根据实际 GPU 自动设置,
-# 也可用启动参数 ro.hardware.vulkan=xxx 手动指定
 props = {
     "ro.hardware.gralloc": "minigbm_gbm_mesa",
+    "ro.hardware.vulkan": "intel",
     "ro.hardware.egl": "mesa",
 }
 lines = open(p).read().splitlines()

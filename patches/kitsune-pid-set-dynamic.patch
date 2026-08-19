@@ -1,0 +1,89 @@
+diff --git a/native/src/core/deny/ptrace.cpp b/native/src/core/deny/ptrace.cpp
+--- a/native/src/core/deny/ptrace.cpp
++++ b/native/src/core/deny/ptrace.cpp
+@@ -51,14 +51,10 @@ static void new_zygote(int pid);
+  * Data structures
+  ******************/
+
+-#define PID_MAX 32768
+-struct pid_set {
+-    bitset<PID_MAX>::const_reference operator[](size_t pos) const { return set[pos - 1]; }
+-    bitset<PID_MAX>::reference operator[](size_t pos) { return set[pos - 1]; }
+-    void reset() { set.reset(); }
+-private:
+-    bitset<PID_MAX> set;
+-};
++// PIDs are allocated from the whole PID namespace and may exceed the
++// historical 32768 bitset limit. Keep only the PIDs currently being tracked
++// so this bookkeeping remains valid for any kernel pid_max value.
++using pid_set = set<int>;
+
+ // zygote pid -> mnt ns
+ static map<int, struct stat> zygote_map;
+@@ -78,9 +74,9 @@ static pid_set checked;
+ #define PTRACE_LOG(...)
+
+ static void detach_pid(int pid, int signal = 0) {
+-    attaches[pid] = false;
+-    allowed[pid] = false;
+-    checked[pid] = false;
++    attaches.erase(pid);
++    allowed.erase(pid);
++    checked.erase(pid);
+     ptrace(PTRACE_DETACH, pid, 0, signal);
+     PTRACE_LOG("detach\n");
+ }
+@@ -331,9 +327,9 @@ static void inotify_event(int) {
+ static void term_thread(int) {
+     LOGD("proc_monitor: cleaning up\n");
+     zygote_map.clear();
+-    attaches.reset();
+-    checked.reset();
+-    allowed.reset();
++    attaches.clear();
++    checked.clear();
++    allowed.clear();
+@@ -466,9 +462,9 @@ void proc_monitor() {
+     // Reset cached result
+     zygote_map.clear();
+-    attaches.reset();
+-    checked.reset();
+-    allowed.reset();
++    attaches.clear();
++    checked.clear();
++    allowed.clear();
+@@ -547,7 +543,7 @@ void proc_monitor() {
+             case PTRACE_EVENT_VFORK:
+                 PTRACE_LOG("zygote forked: [%lu]\n", msg);
+-                attaches[msg] = true;
++                attaches.insert(static_cast<int>(msg));
+@@ -563,7 +559,7 @@ void proc_monitor() {
+             do {
+                 struct stat st {};
+                 char path[128];
+-                if (checked[pid]) goto CHECK_PROC;
++                if (checked.count(pid)) goto CHECK_PROC;
+@@ -582,15 +578,15 @@ void proc_monitor() {
+-                    checked[pid] = true;
+-                if (!allowed[pid] && (
++                    checked.insert(pid);
++                if (!allowed.count(pid) && (
+@@ -591,9 +587,9 @@ void proc_monitor() {
+-                    allowed[pid] = true;
++                    allowed.insert(pid);
+
+-                if (!allowed[pid])
++                if (!allowed.count(pid))
+@@ -604,11 +600,12 @@ void proc_monitor() {
+-            if (!attaches[pid]) {
++            if (!attaches.count(pid)) {
+                 // Double check if this is actually a process
+-                attaches[pid] = is_process(pid);
++                if (is_process(pid))
++                    attaches.insert(pid);
+             }
+-            if (attaches[pid]) {
++            if (attaches.count(pid)) {
+@@ -622,7 +619,7 @@ void proc_monitor() {
+-            xptrace((!zygote_map.count(pid) && attaches[pid]) ?
++            xptrace((!zygote_map.count(pid) && attaches.count(pid)) ?

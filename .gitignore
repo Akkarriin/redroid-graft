@@ -2,7 +2,19 @@
 dl/
 src/
 out/
+scripts/dl/
+scripts/src/
+scripts/out/
 *.tar
 *.zip
 *.img
 *.apk
+*.so
+*.dex
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

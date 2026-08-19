@@ -1,6 +1,7 @@
 #!/bin/bash
-# 构建 redroid 13 (64_32) + libhoudini + Magisk 镜像
+# 在已嫁接 gralloc4 的底图上叠加 libhoudini + Magisk
 # 配方来源: https://github.com/waydroid-helper/extensions
+# 须先跑 ./scripts/gralloc4.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -9,10 +10,12 @@ SRC="$HERE/src"
 OUT="$HERE/out"
 CTR=${CTR:-podman}
 
-BASE_IMAGE="docker.io/redroid/redroid:13.0.0-latest"
+# 基底必须是已嫁接 gralloc4 的镜像, 否则 props 层会盖掉图形栈属性
+BASE_IMAGE="${BASE_IMAGE:-localhost/redroid13-graft:latest}"
 
 # ROOT=kitsune  -> Kitsune Magisk (Delta 后继, 内置 MagiskHide, 隐藏效果好)
 # ROOT=magisk   -> 官方 Magisk v30.7 (只有 DenyList)
+# ROOT=none     -> 不注入 Magisk（仅 houdini；配合 inject-gapps 可出无 root 镜像）
 ROOT="${ROOT:-kitsune}"
 
 HOUDINI_COMMIT="debc3dc91cf12b5c5b8a1c546a5b0b7bf7f838a8"
@@ -42,14 +45,30 @@ case "$ROOT" in
         MAGISK_BIN="magisk"
         MAGISK_APK="magisk.apk"
         ;;
+    none|off|no)
+        ROOT=none
+        MAGISK_VER=""
+        ;;
     *)
-        echo "ROOT 只支持 kitsune 或 magisk"; exit 1 ;;
+        echo "ROOT 只支持 kitsune、magisk 或 none"; exit 1 ;;
 esac
 
-# 默认(Kitsune) tag 不带后缀; 换官方 Magisk 时加上以示区分
+# 默认(Kitsune) 镜像名不带后缀; 换官方 Magisk / 无 root 时加上以示区分
 _root_suffix=""
 [ "$ROOT" = magisk ] && _root_suffix="-official"
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid-graft:13.0.0-houdini-magisk${_root_suffix}}"
+if [ -z "${NEW_IMAGE:-}" ]; then
+    if [ "$ROOT" = none ]; then
+        NEW_IMAGE="localhost/redroid13-graft-houdini:latest"
+    else
+        NEW_IMAGE="localhost/redroid13-graft-houdini-magisk${_root_suffix}:latest"
+    fi
+fi
+
+if ! $CTR image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+    echo "错误: 找不到底图 $BASE_IMAGE" >&2
+    echo "请先运行: ./scripts/gralloc4.sh" >&2
+    exit 1
+fi
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 
@@ -69,7 +88,19 @@ rm -rf "$SRC"; mkdir -p "$SRC"
 
 fetch "$HOUDINI_URL" "$HOUDINI_SHA" "$DL/houdini.zip"
 fetch "$HACK_URL" "$HACK_SHA" "$DL/houdini_hack.zip"
-fetch "$MAGISK_URL" "$MAGISK_SHA" "$DL/$MAGISK_APK"
+if [ "$ROOT" != none ]; then
+    if [ -n "${MAGISK_LOCAL_APK:-}" ]; then
+        [ -f "$MAGISK_LOCAL_APK" ] || {
+            echo "错误: 找不到 MAGISK_LOCAL_APK=$MAGISK_LOCAL_APK" >&2
+            exit 1
+        }
+        cp -f "$MAGISK_LOCAL_APK" "$DL/$MAGISK_APK"
+        MAGISK_SHA="$(sha256sum "$DL/$MAGISK_APK" | cut -d' ' -f1)"
+        msg "使用本地 Magisk APK $(basename "$MAGISK_LOCAL_APK") (sha256=$MAGISK_SHA)"
+    else
+        fetch "$MAGISK_URL" "$MAGISK_SHA" "$DL/$MAGISK_APK"
+    fi
+fi
 
 ########################################
 # 1. libhoudini
@@ -130,8 +161,17 @@ install -Dm644 "$HACKDIR/etc/init/hw/init.rc"         "$HD/system/etc/init/hw/in
 tar --owner=0 --group=0 --numeric-owner -cf "$OUT/houdini.tar" -C "$HD" system
 
 ########################################
-# 2. Magisk
+# 2. Magisk（可选）
 ########################################
+if [ "$ROOT" = none ]; then
+    msg "跳过 Magisk（ROOT=none）"
+    rm -f "$OUT/magisk.tar"
+    # redroid userdebug 自带 /system/xbin/su，无 Magisk 时仍会被游戏当 root
+    msg "白盒删除 stock su（.wh.su）"
+    mkdir -p "$OUT/strip-su/system/xbin" "$OUT/strip-su/system/bin"
+    touch "$OUT/strip-su/system/xbin/.wh.su" "$OUT/strip-su/system/bin/.wh.su"
+    tar --owner=0 --group=0 --numeric-owner -cf "$OUT/strip-su.tar" -C "$OUT/strip-su" .
+else
 msg "组装 $ROOT $MAGISK_VER"
 MG="$SRC/magisk"
 MGDIR="$MG/system/etc/init/magisk"
@@ -237,6 +277,7 @@ tar --numeric-owner --owner=0 --group=0 \
     -cf "$OUT/magisk.tar" -C "$MG" --exclude=system/etc/init/magisk system sbin
 tar --numeric-owner --owner=2000 --group=0 \
     -rf "$OUT/magisk.tar" -C "$MG" system/etc/init/magisk
+fi
 
 ########################################
 # 3. build.prop 覆盖 (native bridge -> houdini)
@@ -297,6 +338,15 @@ tar --owner=0 --group=0 --numeric-owner -cf "$OUT/props.tar" -C "$PR" vendor sys
 # 4. 构建镜像
 ########################################
 msg "构建镜像 $NEW_IMAGE"
+if [ "$ROOT" = none ]; then
+cat > "$OUT/Dockerfile" <<EOF
+FROM $BASE_IMAGE
+
+ADD houdini.tar /
+ADD props.tar /
+ADD strip-su.tar /
+EOF
+else
 cat > "$OUT/Dockerfile" <<EOF
 FROM $BASE_IMAGE
 
@@ -304,6 +354,7 @@ ADD houdini.tar /
 ADD magisk.tar /
 ADD props.tar /
 EOF
+fi
 
 $CTR build -t "$NEW_IMAGE" -f "$OUT/Dockerfile" "$OUT"
 msg "完成: $NEW_IMAGE"
