@@ -21,6 +21,7 @@ redroid 是很好的容器化 Android 方案（无头、多开、adb 直连）�
 |---|---|---|
 | 只有 x86 指令集 | ARM-only 的游戏装不上/闪退 | 注入 libhoudini |
 | linker 命名空间限制 | houdini 加载 `libtcb.so` 被拒 → SIGABRT | 打 ld.config 补丁 |
+| Houdini 内置有效期 | 到期后游戏卡死、CPU 满载 | 构建时严格校验并移除 32/64 位到期分支 |
 | 无 root | 很多工具/脚本用不了 | 注入 Kitsune Magisk |
 | **gralloc 只有 2.0** | **Vulkan-only 的 Unity 游戏黑屏/崩溃** | **移植 Waydroid 的 gralloc4 + Mesa 26** |
 
@@ -45,14 +46,17 @@ Waydroid 本身就有完整的 gralloc4 + Vulkan，桌面上跑游戏没问题�
 ## 快速开始
 
 依赖：`podman` 或 `docker`、`curl`、`unzip`、`e2fsprogs`（`debugfs`）、
-`python3`、`binutils`（`readelf`，做依赖闭包校验）。
-Android 15 实验脚本额外需要 `p7zip`（`7z`，解 squashfs vendor）。
+`python3`、`binutils`（`readelf`，做依赖闭包校验）。LiteGapps 另需带 xz
+支持的 `tar`；Android 15 实验脚本还需 `p7zip`（`7z`）和 `file`。
+
+下载会走 `curl`，脚本遵循标准的 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。
 
 ```bash
 # 1. 图形层：gralloc4 + Mesa 26 + Vulkan（所有变体的底图）
 ./scripts/gralloc4.sh
 
 # 2. 可选：再叠 houdini + Kitsune Magisk（跑 ARM 手游需要）
+#    默认同时移除 32/64 位 Houdini 内置有效期限制
 ./scripts/build.sh
 #    只要 houdini、不要 Magisk：
 #    ROOT=none ./scripts/build.sh
@@ -70,12 +74,13 @@ Android 15 实验脚本额外需要 `p7zip`（`7z`，解 squashfs vendor）。
 | 镜像 | 内容 |
 |---|---|
 | `redroid13-graft:latest` | 仅图形栈改造 |
-| `redroid13-graft-houdini:latest` | 同上 + houdini（无 Magisk） |
-| `redroid13-graft-houdini-gapps:latest` | houdini + MindTheGapps（无 Magisk） |
-| `redroid13-graft-ndk:latest` | 同上 + waydroid-helper ndk_translation（zork R136） |
-| `redroid13-graft-ndk-gapps:latest` | ndk + MindTheGapps（无 Magisk） |
-| `redroid13-graft-houdini-magisk:latest` | 同上 + houdini + Magisk（挂机手游常用） |
-| `redroid13-graft-houdini-magisk-gapps:latest` | 同上 + MindTheGapps |
+| `redroid13-graft-houdini:latest` | 图形栈 + houdini（无 Magisk） |
+| `redroid13-graft-houdini-gapps:latest` | 图形栈 + houdini + MindTheGapps（无 Magisk） |
+| `redroid13-graft-ndk:latest` | 图形栈 + waydroid-helper ndk_translation（zork R136） |
+| `redroid13-graft-ndk-gapps:latest` | 图形栈 + zork NDK + MindTheGapps（无 Magisk） |
+| `redroid13-graft-ndk-stock-magisk:latest` | 诊断用：houdini-magisk 切回 redroid stock NDK |
+| `redroid13-graft-houdini-magisk:latest` | 图形栈 + houdini + Magisk（挂机手游常用） |
+| `redroid13-graft-houdini-magisk-gapps:latest` | 图形栈 + houdini + Magisk + MindTheGapps |
 
 `ROOT=none ./scripts/build.sh` 只要 houdini不要 Magisk。  
 `./scripts/inject-ndk.sh` 在 `redroid13-graft` 上叠 ChromeOS ndk（勿叠在 houdini 镜像上）。
@@ -117,6 +122,8 @@ adb -s $D shell getprop ro.hardware.gralloc      # minigbm_gbm_mesa
 adb -s $D shell getprop ro.hardware.vulkan       # intel
 # 以下仅 houdini-magisk 镜像：
 adb -s $D shell getprop ro.dalvik.vm.native.bridge  # libhoudini.so
+adb -s $D shell sha256sum /system/lib{,64}/libhoudini.so
+# 默认应分别为 96fe3acc...（32 位）和 847be255...（64 位）
 adb -s $D shell grep -c arm64 /linkerconfig/ld.config.txt  # >0
 adb -s $D shell "echo id | /sbin/su"            # uid=0(root)
 adb -s $D shell dumpsys package io.github.huskydg.magisk | grep versionName  # 非 1.0
@@ -142,8 +149,10 @@ adb -s $D shell dumpsys gpu | grep -E 'vkLoading|vkDriverLoadingTime|appPackageN
 
 ### GPU 支持
 
-当前镜像**只打包 Intel Vulkan**（`vulkan.intel` / `intel_hasvk`），
-`ro.hardware.vulkan=intel` 写死在属性里。实测环境：Intel Arc A380（`xe`）。
+默认镜像只打包 Intel Vulkan（`vulkan.intel` / `intel_hasvk`），并设置
+`ro.hardware.vulkan=intel`。`VULKAN_HW` 与 `VK_DRIVERS` 可一起覆盖，脚本会用
+`VULKAN_HW` 生成属性，避免“打包 AMD 驱动却仍加载 Intel”的不一致。
+实测环境：Intel Arc A380（`xe`）。
 
 构建时会对 `libgbm_mesa_wrapper.so` 打补丁，跳过 allocate 时的 `gbm_bo_map`
 探测（否则进系统设置会拖死 `allocator@4`）。详见 [TROUBLESHOOTING §7](docs/TROUBLESHOOTING.md)。
@@ -151,7 +160,8 @@ adb -s $D shell dumpsys gpu | grep -E 'vkLoading|vkDriverLoadingTime|appPackageN
 > 曾改为打包全厂商驱动 + `detect_gpu.sh` 自动选；后来确认 Settings 崩与此无关，
 > 根因是 map_stride 探测。现保持 Intel-only 以减小面。
 
-AMD/NVIDIA 需另改 `VK_DRIVERS` / `ro.hardware.vulkan` 再构建（尚未实机验证）。
+AMD 示例：`VULKAN_HW=radeon VK_DRIVERS=vulkan.radeon.so ./scripts/gralloc4.sh`；
+NVIDIA/Nouveau 同理，但均尚未实机验证。
 
 ## Android 15（实验）
 
@@ -169,7 +179,8 @@ AMD/NVIDIA 需另改 `VK_DRIVERS` / `ro.hardware.vulkan` 再构建（尚未实�
 docs/ARCHITECTURE.md              每一层做了什么
 docs/TROUBLESHOOTING.md           踩过的坑
 patches/kitsune-pid-set-dynamic.patch
-                                  可选：自编译 Kitsune 时用（pid_max > 32768）
+                                  自编译 Kitsune 时修复 PID > 32768
+scripts/patch-houdini-expiry.py   严格校验并移除 Houdini 双 ABI 到期分支
 scripts/gralloc4.sh               redroid 13 图形栈（主路径）
 scripts/gralloc4-15.sh            redroid 15 图形栈（实验）
 scripts/build.sh                  叠 houdini + 可选 Magisk
@@ -179,6 +190,29 @@ scripts/switch-ndk.sh             切回 redroid 自带 ndk（对比用）
 scripts/patch-gbm-mesa-skip-map-stride.py
                                   Arc/xe：跳过 allocate 时的 map_stride 探测
 ```
+
+## Kitsune 的 PID 修复是否必要
+
+问题是真实的：Kitsune `ea3f64a` 的 `ptrace.cpp` 用固定
+`bitset<32768>` 按 PID 下标访问；现代 Linux 的 `kernel.pid_max` 通常是
+4194304，长时间运行后 PID 超过 32768 会越界。先前版本中的补丁还是损坏的
+unified diff；现已在 `ea3f64a97757506707136ff88b0ec730574cae42` 上重新生成，并改用
+按已见最高 PID 动态增长的 packed bitmap：查询 O(1)，没有 32768 硬上限，也没有
+每个 PID 的树/哈希节点分配；即使增长到 Linux 当前 4194304 上限，每组也约 512 KiB。
+
+**注意：默认下载的预编译 Kitsune APK 不含这项源码补丁。** 普通短期实例未必触发；
+长期挂机且容器内 PID 会超过 32768 时，建议从上述 commit 自编译：
+
+```bash
+git checkout ea3f64a97757506707136ff88b0ec730574cae42
+git apply --check /path/to/redroid-graft/patches/kitsune-pid-set-dynamic.patch
+git apply /path/to/redroid-graft/patches/kitsune-pid-set-dynamic.patch
+# 按 Kitsune 上游文档构建 APK，然后：
+MAGISK_LOCAL_APK=/path/to/app-debug.apk ./scripts/build.sh
+```
+
+若容器内 `cat /proc/sys/kernel/pid_max` 不大于 32768，则不需要这项补丁。
+不建议为了规避它而降低宿主全局 `kernel.pid_max`。
 
 ## 文档
 
@@ -206,6 +240,7 @@ scripts/patch-gbm-mesa-skip-map-stride.py
 
 ```bash
 ROOT=magisk ./scripts/build.sh        # 用官方 Magisk（产出 redroid13-graft-houdini-magisk-official:latest）
+PATCH_HOUDINI_EXPIRY=0 ./scripts/build.sh  # 诊断：保留原版有效期行为
 CTR=docker ./scripts/gralloc4.sh      # 用 docker 而非 podman
 BUILD_IMAGE=0 ./scripts/gralloc4.sh   # 只生成 tar 层，不构建镜像
 NEW_IMAGE=myrepo/android:13 ./scripts/gralloc4.sh
@@ -214,7 +249,7 @@ NEW_IMAGE=myrepo/android:13 ./scripts/gralloc4.sh
 ## 已知限制
 
 - **只在 Intel Arc A380 + xe 驱动上实测过**。默认只打包 Intel Vulkan；
-  AMD/NVIDIA 需改 `VK_DRIVERS` / `ro.hardware.vulkan`（尚未实机验证）。
+  AMD/NVIDIA 需设置 `VULKAN_HW` / `VK_DRIVERS`（尚未实机验证）。
 - 镜像约 2.5 GB（主要是 Mesa 26 的 `libLLVM22` 64/32 位各一份）。
 - 基于 redroid 13。更高版本 redroid 的 vendor 分区布局相同，
   理论上改 `gralloc4.sh` 的 `BASE_IMAGE` 即可，但 houdini 的 linker 补丁需要对应版本

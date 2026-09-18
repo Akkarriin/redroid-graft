@@ -52,18 +52,31 @@ if ! $CTR image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
 fi
 
 fetch() {
-    local url=$1 sha=$2 dest=$3
+    local url=$1 sha=$2 dest=$3 tmp="${3}.part"
     if [ -f "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
         msg "已缓存 $(basename "$dest")"
         return
     fi
     msg "下载 $(basename "$dest")"
-    curl -fL --retry 3 -o "$dest" "$url"
-    [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ] || {
-        echo "sha256 校验失败: $dest" >&2; exit 1; }
+    rm -f "$tmp"
+    curl -fL --retry 3 -o "$tmp" "$url"
+    [ "$(sha256sum "$tmp" | cut -d' ' -f1)" = "$sha" ] || {
+        rm -f "$tmp"; echo "sha256 校验失败: $dest" >&2; exit 1; }
+    mv -f "$tmp" "$dest"
+}
+
+copy_from_base() { # path-in-image dest
+    local src=$1 dest=$2 cid
+    cid=$($CTR create "$BASE_IMAGE")
+    if ! $CTR cp "$cid:$src" "$dest"; then
+        $CTR rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    $CTR rm "$cid" >/dev/null
 }
 
 mkdir -p "$DL" "$OUT"
+rm -f "$OUT/gapps.tar" "$OUT/Dockerfile.gapps"
 rm -rf "$SRC"; mkdir -p "$SRC/layer" "$SRC/extract"
 
 fetch "$GAPPS_URL" "$GAPPS_SHA" "$GAPPS_ZIP"
@@ -73,11 +86,13 @@ case "$GAPPS" in
     mindthe|mindthegapps)
         # EXTENSION package(): unzip; cp -rf system $pkgdir/
         unzip -oq "$GAPPS_ZIP" -d "$SRC/extract"
-        if [ -d "$SRC/extract/system" ]; then
-            cp -a "$SRC/extract/system" "$SRC/layer/system"
-        elif [ -d "$SRC/extract/system/system" ]; then
+        # 先检查更具体的嵌套布局；否则 system/system 存在时其父目录
+        # 必然先命中，fallback 永远不可达。
+        if [ -d "$SRC/extract/system/system" ]; then
             mkdir -p "$SRC/layer/system"
             cp -a "$SRC/extract/system/system/." "$SRC/layer/system/"
+        elif [ -d "$SRC/extract/system" ]; then
+            cp -a "$SRC/extract/system" "$SRC/layer/system"
         else
             echo "MindTheGapps zip 里找不到 system/" >&2
             find "$SRC/extract" -maxdepth 3 -type d | head -40 >&2
@@ -95,12 +110,12 @@ case "$GAPPS" in
     lite|litegapps)
         # EXTENSION: tar -xvf files/files.tar.xz --strip-components=2 CARCH/33/system
         unzip -oq "$GAPPS_ZIP" -d "$SRC/extract"
-        TARXZ=$(find "$SRC/extract" -name 'files.tar.xz' | head -1)
+        TARXZ=$(find "$SRC/extract" -name 'files.tar.xz' -print -quit)
         [ -n "$TARXZ" ] || { echo "LiteGapps 缺少 files/files.tar.xz" >&2; exit 1; }
         mkdir -p "$SRC/tmp_lite" "$SRC/layer"
         tar -xJf "$TARXZ" -C "$SRC/tmp_lite"
-        SYS=$(find "$SRC/tmp_lite" -type d -path '*/x86_64/33/system' | head -1)
-        [ -n "$SYS" ] || SYS=$(find "$SRC/tmp_lite" -type d -path '*/33/system' | head -1)
+        SYS=$(find "$SRC/tmp_lite" -type d -path '*/x86_64/33/system' -print -quit)
+        [ -n "$SYS" ] || SYS=$(find "$SRC/tmp_lite" -type d -path '*/33/system' -print -quit)
         [ -n "$SYS" ] || { echo "LiteGapps 解不出 system" >&2; find "$SRC/tmp_lite" | head -40 >&2; exit 1; }
         BASE=$(dirname "$SYS")
         cp -a "$BASE/system" "$SRC/layer/system"
@@ -126,9 +141,7 @@ if [ "$SKIP_SETUP" = 1 ]; then
     msg "写入 ro.setupwizard.mode=DISABLED（跳过 GApps 向导）"
     mkdir -p "$SRC/layer/system/etc/prop.d" "$SRC/layer/system"
     # prop.d 在部分镜像不生效; 再 patch 一份从底图拷出的 system/build.prop
-    CID=$($CTR create "$BASE_IMAGE")
-    $CTR cp "$CID:/system/build.prop" "$SRC/layer/system/build.prop" 2>/dev/null || true
-    $CTR rm "$CID" >/dev/null
+    copy_from_base /system/build.prop "$SRC/layer/system/build.prop" 2>/dev/null || true
     if [ -f "$SRC/layer/system/build.prop" ]; then
         python3 - "$SRC/layer/system/build.prop" <<'PY'
 import re, sys
@@ -159,7 +172,8 @@ fi
 
 msg "打包 gapps.tar"
 # 统计一下装了什么
-find "$SRC/layer" -name '*.apk' | sed 's|.*/||' | sort -u | head -40
+# sed 会读完整输入；避免 set -o pipefail 下 head 提前关闭管道造成 SIGPIPE。
+find "$SRC/layer" -name '*.apk' | sed 's|.*/||' | sort -u | sed -n '1,40p'
 APK_N=$(find "$SRC/layer" -name '*.apk' | wc -l)
 msg "共 $APK_N 个 apk"
 

@@ -38,7 +38,8 @@ Kitsune 上游地址已 404，于是自杀退出。
 **第二版**：用 `install_app.sh` 按 versionName 判断，识别到 `1.0` 就覆盖。
 → 手动跑能修好，但开机时依旧是壳。
 
-**真正的原因是时序**。看日志：
+**真正的原因是时序**。`magisk.rc` 中的首次安装和 magiskd 自己安装 stub
+没有固定先后。看日志：
 
 ```
 22:28:49  I Magisk : pm_install: /data/stub.apk     ← magiskd 自己装的
@@ -46,7 +47,7 @@ Kitsune 上游地址已 404，于是自杀退出。
 ```
 
 magiskd 在它自己的时机 `pm_install /data/stub.apk`，
-**而且这个时机可能在 bootanim.rc 的 `install_app.sh` 之后**。
+**而且这个时机可能在 `magisk.rc` 启动 `install_app.sh` 之后**。
 只检查一次的脚本：开机时看到"未安装"→装了完整版→随后被 magiskd 覆盖回 stub。
 
 **最终方案**：后台持续监视两分钟，发现壳就盖回来：
@@ -132,6 +133,28 @@ adb shell "grep -c arm64 /linkerconfig/ld.config.txt"   # >0 即生效
 
 > 补丁在 `/linkerconfig`（tmpfs），**容器重启会丢**，必须由 init.rc 每次开机重打。
 > 调试时如果发现"昨天好的今天又坏了"，先查这个。
+
+### 3.1 Houdini 到期后游戏卡死、CPU 满载
+
+**现象** — ARM 游戏停在黑屏/标题前，进程持续占用数个 CPU 核；调试回溯落在
+`libhoudini.so` 的循环或 `sched_yield` 附近。HPE 14 的内置有效期已触发。
+
+**现行修复** — `build.sh` 默认调用 `patch-houdini-expiry.py`，同时禁用 32 位和
+64 位到期失败分支。它是构建期补丁，已经进入镜像层，普通容器重启不会丢失：
+
+```bash
+adb shell sha256sum /system/lib/libhoudini.so
+# 96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993
+adb shell sha256sum /system/lib64/libhoudini.so
+# 847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8
+```
+
+若构建报 `unsupported libhoudini.so SHA-256`，说明上游二进制已变化或缓存损坏。
+**不要加 force、不要搜索相似字节后盲打**；先确认下载包 SHA，再对新版的两种 ABI
+重新做控制流审计、更新原/目标完整 SHA 和偏移。可用
+`PATCH_HOUDINI_EXPIRY=0` 构建原版做负对照，但它不会解决到期问题。
+
+“永久”只针对当前锁定的 HPE 二进制及已知检查路径；更新 Houdini 后必须重新审计。
 
 ---
 

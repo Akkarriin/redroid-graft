@@ -1,28 +1,64 @@
 diff --git a/native/src/core/deny/ptrace.cpp b/native/src/core/deny/ptrace.cpp
+index 6a7ca45..100b210 100644
 --- a/native/src/core/deny/ptrace.cpp
 +++ b/native/src/core/deny/ptrace.cpp
-@@ -51,14 +51,10 @@ static void new_zygote(int pid);
+@@ -4,9 +4,7 @@
+ #include <sys/mount.h>
+ #include <vector>
+ #include <string>
+-#include <set>
+ #include <map>
+-#include <bitset>
+ #include <string>
+ #include <cinttypes>
+ #include <poll.h>
+@@ -51,13 +49,37 @@ static void new_zygote(int pid);
   * Data structures
   ******************/
-
+ 
 -#define PID_MAX 32768
 -struct pid_set {
 -    bitset<PID_MAX>::const_reference operator[](size_t pos) const { return set[pos - 1]; }
 -    bitset<PID_MAX>::reference operator[](size_t pos) { return set[pos - 1]; }
 -    void reset() { set.reset(); }
--private:
++// PIDs may exceed the historical 32768 limit. Grow a packed bitmap to the
++// highest PID actually observed: O(1) lookup, no fixed pid_max assumption, and
++// only about 512 KiB per set even at Linux's current 4M PID ceiling.
++class pid_set {
++public:
++    bool count(pid_t pid) const {
++        if (pid <= 0) return false;
++        const size_t word = static_cast<size_t>(pid) / 64;
++        const uint64_t bit = uint64_t{1} << (pid % 64);
++        return word < words.size() && (words[word] & bit);
++    }
++
++    void insert(pid_t pid) {
++        if (pid <= 0) return;
++        const size_t word = static_cast<size_t>(pid) / 64;
++        if (word >= words.size()) words.resize(word + 1);
++        words[word] |= uint64_t{1} << (pid % 64);
++    }
++
++    void erase(pid_t pid) {
++        if (pid <= 0) return;
++        const size_t word = static_cast<size_t>(pid) / 64;
++        if (word < words.size()) words[word] &= ~(uint64_t{1} << (pid % 64));
++    }
++
++    void clear() {
++        for (auto &word : words) word = 0;
++    }
++
+ private:
 -    bitset<PID_MAX> set;
--};
-+// PIDs are allocated from the whole PID namespace and may exceed the
-+// historical 32768 bitset limit. Keep only the PIDs currently being tracked
-+// so this bookkeeping remains valid for any kernel pid_max value.
-+using pid_set = set<int>;
-
++    vector<uint64_t> words;
+ };
+ 
  // zygote pid -> mnt ns
- static map<int, struct stat> zygote_map;
-@@ -78,9 +74,9 @@ static pid_set checked;
+@@ -78,9 +100,9 @@ static pid_set checked;
  #define PTRACE_LOG(...)
-
+ 
  static void detach_pid(int pid, int signal = 0) {
 -    attaches[pid] = false;
 -    allowed[pid] = false;
@@ -33,7 +69,7 @@ diff --git a/native/src/core/deny/ptrace.cpp b/native/src/core/deny/ptrace.cpp
      ptrace(PTRACE_DETACH, pid, 0, signal);
      PTRACE_LOG("detach\n");
  }
-@@ -331,9 +327,9 @@ static void inotify_event(int) {
+@@ -331,9 +353,9 @@ static void inotify_event(int) {
  static void term_thread(int) {
      LOGD("proc_monitor: cleaning up\n");
      zygote_map.clear();
@@ -43,7 +79,11 @@ diff --git a/native/src/core/deny/ptrace.cpp b/native/src/core/deny/ptrace.cpp
 +    attaches.clear();
 +    checked.clear();
 +    allowed.clear();
-@@ -466,9 +462,9 @@ void proc_monitor() {
+     close(inotify_fd);
+     inotify_fd = -1;
+     monitor_thread = -1;
+@@ -466,9 +488,9 @@ void proc_monitor() {
+ 
      // Reset cached result
      zygote_map.clear();
 -    attaches.reset();
@@ -52,38 +92,68 @@ diff --git a/native/src/core/deny/ptrace.cpp b/native/src/core/deny/ptrace.cpp
 +    attaches.clear();
 +    checked.clear();
 +    allowed.clear();
-@@ -547,7 +543,7 @@ void proc_monitor() {
+ 
+     // Backup original mask
+     sigset_t orig_mask;
+@@ -547,7 +569,7 @@ void proc_monitor() {
+             case PTRACE_EVENT_FORK:
              case PTRACE_EVENT_VFORK:
                  PTRACE_LOG("zygote forked: [%lu]\n", msg);
 -                attaches[msg] = true;
-+                attaches.insert(static_cast<int>(msg));
-@@ -563,7 +559,7 @@ void proc_monitor() {
++                attaches.insert(static_cast<pid_t>(msg));
+                 break;
+             case PTRACE_EVENT_EXIT:
+                 PTRACE_LOG("zygote exited with status: [%lu]\n", msg);
+@@ -563,7 +585,7 @@ void proc_monitor() {
              do {
                  struct stat st {};
                  char path[128];
 -                if (checked[pid]) goto CHECK_PROC;
 +                if (checked.count(pid)) goto CHECK_PROC;
-@@ -582,15 +578,15 @@ void proc_monitor() {
+                 sprintf(path, "/proc/%d", pid);
+                 stat(path, & st);
+                 PTRACE_LOG("UID=[%d]\n", st.st_uid);
+@@ -582,15 +604,15 @@ void proc_monitor() {
+                     goto DETACH_PROC;
+ 
+                 CHECK_PROC:
 -                    checked[pid] = true;
 -                if (!allowed[pid] && (
 +                    checked.insert(pid);
 +                if (!allowed.count(pid) && (
-@@ -591,9 +587,9 @@ void proc_monitor() {
+                         // app zygote
+                         strstr(get_content(pid, "attr/current").data(), "u:r:app_zygote:s0") ||
+                         // until pre-initialized
+                         get_content(pid, "cmdline") == "<pre-initialized>"))
 -                    allowed[pid] = true;
 +                    allowed.insert(pid);
-
+ 
 -                if (!allowed[pid])
 +                if (!allowed.count(pid))
-@@ -604,11 +600,12 @@ void proc_monitor() {
+                     continue;
+ 
+                 if (check_pid(pid))
+@@ -604,11 +626,11 @@ void proc_monitor() {
+             xptrace(PTRACE_SYSCALL, pid);
+         } else if (signal == SIGSTOP) {
+             // SIGSTOP is produced by ptrace
 -            if (!attaches[pid]) {
-+            if (!attaches.count(pid)) {
++            if (!attaches.count(pid) && is_process(pid)) {
                  // Double check if this is actually a process
 -                attaches[pid] = is_process(pid);
-+                if (is_process(pid))
-+                    attaches.insert(pid);
++                attaches.insert(pid);
              }
 -            if (attaches[pid]) {
 +            if (attaches.count(pid)) {
-@@ -622,7 +619,7 @@ void proc_monitor() {
--            xptrace((!zygote_map.count(pid) && attaches[pid]) ?
+                 // This is a process, continue monitoring
+                 PTRACE_LOG("SIGSTOP from child\n");
+                 xptrace(PTRACE_SETOPTIONS, pid, nullptr,
+@@ -622,7 +644,7 @@ void proc_monitor() {
+             }
+         } else {
+             // Not caused by us, resend signal
+-            xptrace((!zygote_map.count(pid) && attaches[pid]) ? 
 +            xptrace((!zygote_map.count(pid) && attaches.count(pid)) ?
+                     PTRACE_SYSCALL : PTRACE_CONT, pid, nullptr, signal);
+             PTRACE_LOG("signal [%d]\n", signal);
+         }

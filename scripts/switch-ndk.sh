@@ -17,11 +17,24 @@ OUT="$HERE/out"
 CTR=${CTR:-podman}
 
 BASE_IMAGE="${BASE_IMAGE:-localhost/redroid13-graft-houdini-magisk:latest}"
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid13-graft-ndk:latest}"
+# 这是“保留 Magisk、切回 redroid stock NDK”的诊断变体，不与正式 zork
+# R136 的 redroid13-graft-ndk:latest 共用名称或输出文件。
+NEW_IMAGE="${NEW_IMAGE:-localhost/redroid13-graft-ndk-stock-magisk:latest}"
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 
+copy_from_base() { # path-in-image dest
+    local src=$1 dest=$2 cid
+    cid=$($CTR create "$BASE_IMAGE")
+    if ! $CTR cp "$cid:$src" "$dest"; then
+        $CTR rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    $CTR rm "$cid" >/dev/null
+}
+
 rm -rf "$SRC"; mkdir -p "$SRC/system/etc/init" "$SRC/props" "$OUT"
+rm -f "$OUT/ndk-stock.tar" "$OUT/Dockerfile.ndk-stock"
 
 ########################################
 # 1. 恢复 ndk_translation.rc
@@ -29,17 +42,18 @@ rm -rf "$SRC"; mkdir -p "$SRC/system/etc/init" "$SRC/props" "$OUT"
 ########################################
 msg "恢复 ndk_translation.rc"
 cat > "$SRC/system/etc/init/ndk_translation.rc" <<'EOF'
-# Enable native bridge for target executables
+# Enable the stock native bridge; use exec+cat because init's copy command is
+# unreliable when the destination is binfmt_misc's special register file.
 on early-init && property:ro.enable.native.bridge.exec=1
     mount binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
 
 on property:ro.enable.native.bridge.exec=1 && property:ro.dalvik.vm.isa.arm=x86
-    copy /system/etc/binfmt_misc/arm_exe /proc/sys/fs/binfmt_misc/register
-    copy /system/etc/binfmt_misc/arm_dyn /proc/sys/fs/binfmt_misc/register
+    exec -- /system/bin/sh -c "cat /system/etc/binfmt_misc/arm_exe > /proc/sys/fs/binfmt_misc/register"
+    exec -- /system/bin/sh -c "cat /system/etc/binfmt_misc/arm_dyn > /proc/sys/fs/binfmt_misc/register"
 
 on property:ro.enable.native.bridge.exec=1 && property:ro.dalvik.vm.isa.arm64=x86_64
-    copy /system/etc/binfmt_misc/arm64_exe /proc/sys/fs/binfmt_misc/register
-    copy /system/etc/binfmt_misc/arm64_dyn /proc/sys/fs/binfmt_misc/register
+    exec -- /system/bin/sh -c "cat /system/etc/binfmt_misc/arm64_exe > /proc/sys/fs/binfmt_misc/register"
+    exec -- /system/bin/sh -c "cat /system/etc/binfmt_misc/arm64_dyn > /proc/sys/fs/binfmt_misc/register"
 EOF
 chmod 0644 "$SRC/system/etc/init/ndk_translation.rc"
 
@@ -69,10 +83,8 @@ chmod 0644 "$SRC/system/etc/binfmt_misc/"*
 # 3. 属性: native bridge 指回 libnb.so (= libndk_translation.so 的软链)
 ########################################
 msg "改写 build.prop"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR cp "$CID:/vendor/build.prop" "$SRC/props/vendor.build.prop"
-$CTR cp "$CID:/system/build.prop" "$SRC/props/system.build.prop"
-$CTR rm "$CID" >/dev/null
+copy_from_base /vendor/build.prop "$SRC/props/vendor.build.prop"
+copy_from_base /system/build.prop "$SRC/props/system.build.prop"
 
 python3 - "$SRC/props" <<'PYEOF'
 import os, re, sys
@@ -103,16 +115,16 @@ cp -a "$SRC/system/." "$SRC/layer/system/"
 install -Dm644 "$SRC/props/vendor.build.prop" "$SRC/layer/vendor/build.prop"
 install -Dm644 "$SRC/props/system.build.prop" "$SRC/layer/system/build.prop"
 
-tar --owner=0 --group=0 --numeric-owner -cf "$OUT/ndk.tar" -C "$SRC/layer" system vendor
+tar --owner=0 --group=0 --numeric-owner -cf "$OUT/ndk-stock.tar" -C "$SRC/layer" system vendor
 
-cat > "$OUT/Dockerfile.ndk" <<EOF
+cat > "$OUT/Dockerfile.ndk-stock" <<EOF
 FROM $BASE_IMAGE
 
-ADD ndk.tar /
+ADD ndk-stock.tar /
 EOF
 
 if [ "${BUILD_IMAGE:-1}" = 1 ]; then
     msg "构建镜像 $NEW_IMAGE"
-    $CTR build -t "$NEW_IMAGE" -f "$OUT/Dockerfile.ndk" "$OUT"
+    $CTR build -t "$NEW_IMAGE" -f "$OUT/Dockerfile.ndk-stock" "$OUT"
     msg "完成: $NEW_IMAGE"
 fi

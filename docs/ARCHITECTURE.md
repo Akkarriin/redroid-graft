@@ -128,12 +128,13 @@ SW buffer 已 `force_linear`，`map_stride == stride`。构建时由
 | `libdrm_{intel,amdgpu,radeon}.so` | 三个都已打包（供 Mesa 链接） |
 | `vulkan.*.so` | **是** — 分文件 |
 
-当前默认只搬 `vulkan.intel.so` / `vulkan.intel_hasvk.so`，
-`ro.hardware.vulkan=intel` 写死在 `vendor/build.prop`。
+当前默认只搬 `vulkan.intel.so` / `vulkan.intel_hasvk.so`，并写入
+`ro.hardware.vulkan=intel`。可同时设置 `VULKAN_HW`、`VK_DRIVERS` 构建其它厂商；
+属性值由 `VULKAN_HW` 生成，不再与提取的驱动脱节。
 
 曾打包全厂商 + `detect_gpu.sh` 自动选；后来发现 Settings 崩与此无关
-（Intel-only 一样崩），根因是上一节的 map 探测。为减小面，先保持 Intel-only。
-AMD/NVIDIA 需改 `VK_DRIVERS` / `ro.hardware.vulkan` 再构建（尚未实机验证）。
+（Intel-only 一样崩），根因是上一节的 map 探测。为减小面，默认仍是 Intel-only。
+AMD/NVIDIA 尚未实机验证。
 
 ### 依赖闭包
 
@@ -149,8 +150,10 @@ AMD/NVIDIA 需改 `VK_DRIVERS` / `ro.hardware.vulkan` 再构建（尚未实机�
 
 ### houdini.tar — ARM 翻译
 
-来源：`supremegamers/vendor_intel_proprietary_houdini` 的 `hpe-14` 分支
-（Google Play Games for PC 的 HPE 镜像，版本 14.0.0_z）。
+来源：`supremegamers/vendor_intel_proprietary_houdini` 的固定 commit
+`debc3dc91cf12b5c5b8a1c546a5b0b7bf7f838a8`（Google Play Games for PC
+的 HPE 镜像）。32 位库为 `14.0.0_y.GoogleGame_com1.2`，64 位库为
+`14.0.0_z.GoogleGame_com1.2`。
 
 ```
 system/bin/houdini, houdini64
@@ -163,6 +166,21 @@ system/etc/init/houdini.rc
 `houdini.rc` 在 `early-init` 挂载 binfmt_misc，然后在
 `ro.enable.native.bridge.exec=1` 时注册四条 ARM ELF 魔数规则，
 把 arm/arm64 可执行文件路由到 houdini 解释器。
+
+#### 有效期补丁（默认开启）
+
+HPE 库内置有效期；到期后不是正常退出，而是进入异常路径，表现为 ARM 游戏卡死、
+CPU 满载。`scripts/patch-houdini-expiry.py` 在打包前同时处理两种 ABI：
+
+| 路径 | 原 SHA256 | 偏移 / 原字节 | 补丁后 SHA256 |
+|---|---|---|---|
+| `system/lib/libhoudini.so` | `f8df8ff7…2f9866` | `0x8a29a` / `0f830b0d0000` | `96fe3acc…4e993` |
+| `system/lib64/libhoudini.so` | `b321439d…5f1e` | `0xe6085` / `0f83680d0000` | `847be255…23b8` |
+
+两条 `jae` 均替换为 6 个 NOP，完全绕过到期后的失败分支，而不是把日期延长到
+另一个年份。补丁器同时检查压缩包 SHA、单文件完整 SHA、原指令和补丁后 SHA；
+未知版本会失败退出，绝不按偏移盲打。重复运行是幂等的，且 `houdini.tar` 内的两个
+成员会再次校验。`PATCH_HOUDINI_EXPIRY=0` 可保留原版行为用于负对照。
 
 同时用一个空文件覆盖 `system/etc/init/ndk_translation.rc`，
 禁用 redroid 自带的 libndk_translation——两者会争抢 binfmt_misc 注册。
@@ -191,16 +209,17 @@ F libc   : Fatal signal 6 (SIGABRT)
 ```
 
 **难点在于 `/linkerconfig` 是 tmpfs，每次开机由 `linkerconfig` 工具重新生成**，
-不能预先写死。解决办法是替换 `system/etc/init/hw/init.rc`，
-在 `perform_apex_config` 之后插入两行：
+不能预先写死。构建时从直接父镜像提取 `system/etc/init/hw/init.rc`，要求
+`perform_apex_config` 锚点恰好出现一次，并在其后插入两行：
 
 ```
 exec -- /system/bin/sh -c "/system/bin/patch /linkerconfig/ld.config.txt < /system/etc/ld_config.patch"
 exec -- /system/bin/sh -c "/system/bin/patch /linkerconfig/com.android.media.swcodec/ld.config.txt < /system/etc/ld_config_swcodec.patch"
 ```
 
-替换整个 init.rc 有覆盖 redroid 自身改动的风险，所以脚本里加了硬校验：
-diff 上游快照与基础镜像的 init.rc，**除这两行外必须完全一致**，否则报错退出。
+最终层仍会覆盖这个文件，但内容来自直接父镜像而不是第三方仓库的陈旧快照；
+因此父镜像新增的 trigger/服务参数会保留。已存在未知 linker 补丁或锚点数量异常时
+会 fail closed。
 
 ### magisk.tar — Root
 
@@ -209,19 +228,29 @@ Kitsune Magisk 27.2（Magisk Delta 的继任分支，内置 MagiskHide，
 
 ```
 system/etc/init/magisk/{magisk64,magiskboot,magiskinit,magiskpolicy,busybox,...}
-system/etc/init/bootanim.rc     ← 借 bootanim 服务启动 magisk
+system/etc/init/magisk.rc       ← 独立的 Magisk 启动 trigger，不覆盖 bootanim 服务
 ```
 
-`bootanim.rc` 在 `post-fs-data` 阶段跑 magiskpolicy 和 `--setup-sbin`。
+`magisk.rc` 在 `post-fs-data` 阶段跑 magiskpolicy 和 `--setup-sbin`。
+Android init 会加载 `/system/etc/init/*.rc`，无需重写父镜像的 `bootanim.rc`。
 两个容易踩的点：
 
 1. **magisk 目录属主必须是 `2000:0`**（shell:root），否则 magisk 拒绝加载
 2. **stub 壳问题**（详见 TROUBLESHOOTING.md #1）。magiskd 在 `--boot-complete`
    发现 app 未安装时，会自己拿 `stub.apk` 装个 41KB 的壳（versionName=1.0），
    而壳要联网下载完整版，Kitsune 上游地址已 404 → `System.exit(0)` 自杀。
-   而且 **magiskd 装壳的时机可能晚于 bootanim.rc**，所以一次性检查会被覆盖。
+   而且 **magiskd 装壳的时机可能晚于 magisk.rc 的首次检查**，所以一次性检查会被覆盖。
    处理方式：`install_app.sh` 用 `exec_background` 后台持续监视两分钟，
    每 2 秒查一次 versionName，发现是 `1.0`（壳）或未安装就重装完整版
+
+#### PID > 32768
+
+Kitsune `ea3f64a` 源码用固定 `bitset<32768>` 追踪 PID，而现代内核的
+`pid_max` 往往更高。`patches/kitsune-pid-set-dynamic.patch` 已在完整 commit
+`ea3f64a97757506707136ff88b0ec730574cae42` 上重生成，改为按已见最高 PID
+动态增长的 packed bitmap（O(1)，无逐节点分配）。但 `build.sh` 默认下载的是上游
+预编译 APK，**不会自动带上源码补丁**；长期运行且 PID 可能超过 32768 时，应自编译后通过
+`MAGISK_LOCAL_APK` 注入。应用命令见 README。
 
 ### props.tar — 属性
 
@@ -232,9 +261,11 @@ ro.dalvik.vm.native.bridge = libhoudini.so
 ro.enable.native.bridge.exec = 1
 ro.dalvik.vm.isa.arm   = x86
 ro.dalvik.vm.isa.arm64 = x86_64
-ro.product.cpu.abilist = x86_64,x86,arm64-v8a,armeabi-v7a,armeabi
+ro.vendor.product.cpu.abilist = x86_64,x86,arm64-v8a,armeabi-v7a,armeabi
+ro.system.product.cpu.abilist = x86_64,x86,arm64-v8a,armeabi-v7a,armeabi
 ```
 
+Android 启动后会由这些分区属性汇总出通用 `ro.product.cpu.abilist`。
 模板取自上一层（已含 gralloc4 的 `redroid13-graft`），**只改写上述键**，
 不会冲掉 `ro.hardware.gralloc` / `ro.hardware.egl`。
 
@@ -286,8 +317,10 @@ Play 商店首次使用通常还要到 Google 登记设备的 GSF `android_id`
 产出 `redroid13-graft-ndk:latest`。配方对齐 waydroid-helper extensions。
 
 不要叠在已注入 houdini 的镜像上：两者会争抢 binfmt_misc 和 native bridge。
-`switch-ndk.sh` 是另一条路径——把 houdini 镜像切回 redroid 自带的
-`libndk_translation`，只用于对比，不下载 ChromeOS 那套。
+`switch-ndk.sh` 是另一条路径——把 houdini-magisk 镜像切回 redroid 自带的
+`libndk_translation`，只用于对比，不下载 ChromeOS 那套。它使用独立的
+`ndk-stock.tar` / `Dockerfile.ndk-stock`，默认镜像名为
+`redroid13-graft-ndk-stock-magisk:latest`，不会覆盖正式 zork NDK 产物。
 
 ---
 

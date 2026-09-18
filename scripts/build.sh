@@ -18,6 +18,14 @@ BASE_IMAGE="${BASE_IMAGE:-localhost/redroid13-graft:latest}"
 # ROOT=none     -> 不注入 Magisk（仅 houdini；配合 inject-gapps 可出无 root 镜像）
 ROOT="${ROOT:-kitsune}"
 
+# 默认同时移除 32/64 位 HPE Houdini 的内置有效期失败分支。
+# 设为 0 仅用于保留上游原版行为做对照；未知二进制始终 fail closed。
+PATCH_HOUDINI_EXPIRY="${PATCH_HOUDINI_EXPIRY:-1}"
+case "$PATCH_HOUDINI_EXPIRY" in
+    0|1) ;;
+    *) echo "PATCH_HOUDINI_EXPIRY 只支持 0 或 1" >&2; exit 1 ;;
+esac
+
 HOUDINI_COMMIT="debc3dc91cf12b5c5b8a1c546a5b0b7bf7f838a8"
 HOUDINI_URL="https://github.com/supremegamers/vendor_intel_proprietary_houdini/archive/${HOUDINI_COMMIT}.zip"
 HOUDINI_SHA="7c78abbcced1f7c5c1cc794a0afb4010a2e5bb0bb18eadd6de3af2fe13e9dc25"
@@ -73,17 +81,33 @@ fi
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 
 fetch() { # url sha256 dest
-    local url=$1 sha=$2 dest=$3
+    local url=$1 sha=$2 dest=$3 tmp="${3}.part"
     if [ -f "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
         msg "已缓存 $(basename "$dest")"
         return
     fi
     msg "下载 $(basename "$dest")"
-    curl -fL --retry 3 -o "$dest" "$url"
-    [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ] || { echo "sha256 校验失败: $dest"; exit 1; }
+    rm -f "$tmp"
+    curl -fL --retry 3 -o "$tmp" "$url"
+    [ "$(sha256sum "$tmp" | cut -d' ' -f1)" = "$sha" ] || {
+        rm -f "$tmp"; echo "sha256 校验失败: $dest" >&2; exit 1; }
+    mv -f "$tmp" "$dest"
+}
+
+# docker/podman cp 失败时也清掉临时容器。
+copy_from_base() { # path-in-image dest
+    local src=$1 dest=$2 cid
+    cid=$($CTR create "$BASE_IMAGE")
+    if ! $CTR cp "$cid:$src" "$dest"; then
+        $CTR rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    $CTR rm "$cid" >/dev/null
 }
 
 mkdir -p "$DL" "$OUT"
+rm -f "$OUT/houdini.tar" "$OUT/magisk.tar" "$OUT/strip-su.tar" \
+      "$OUT/props.tar" "$OUT/Dockerfile"
 rm -rf "$SRC"; mkdir -p "$SRC"
 
 fetch "$HOUDINI_URL" "$HOUDINI_SHA" "$DL/houdini.zip"
@@ -110,6 +134,20 @@ HD="$SRC/houdini"
 unzip -q "$DL/houdini.zip" -d "$SRC/houdini-zip"
 mkdir -p "$HD/system"
 cp -a "$SRC/houdini-zip/vendor_intel_proprietary_houdini-$HOUDINI_COMMIT/prebuilts/." "$HD/system/"
+
+# hpe-14 的 32/64 位库各自带有效期路径。严格按完整输入/输出 SHA 和
+# 原指令门控，未知版本拒绝按固定偏移盲打。
+if [ "$PATCH_HOUDINI_EXPIRY" = 1 ]; then
+    msg "移除 Houdini 32/64 位有效期限制"
+    python3 "$HERE/patch-houdini-expiry.py" \
+        "$HD/system/lib/libhoudini.so" \
+        "$HD/system/lib64/libhoudini.so"
+else
+    msg "保留 Houdini 原版有效期限制（PATCH_HOUDINI_EXPIRY=0）"
+    python3 "$HERE/patch-houdini-expiry.py" --verify-original \
+        "$HD/system/lib/libhoudini.so" \
+        "$HD/system/lib64/libhoudini.so"
+fi
 
 # native bridge init.rc: 用 exec 写 binfmt_misc, 不依赖 init 的 copy 语义
 mkdir -p "$HD/system/etc/init"
@@ -144,21 +182,56 @@ HACKDIR="$SRC/hack-zip/redroid_libhoudini_hack-$HACK_COMMIT/13.0.0"
 install -Dm644 "$HACKDIR/etc/ld_config.patch"         "$HD/system/etc/ld_config.patch"
 install -Dm644 "$HACKDIR/etc/ld_config_swcodec.patch" "$HD/system/etc/ld_config_swcodec.patch"
 
-# hack 的 init.rc 是上游快照, 必须确认它除了 patch 那几行外与基础镜像一致,
-# 否则会静默覆盖掉 redroid 对 init.rc 的改动
+# 不再用第三方仓库的整份 init.rc 快照覆盖父镜像。以直接父镜像版本为模板，
+# 在唯一的 perform_apex_config 锚点后插入两条命令，避免丢失 redroid 后续改动。
 BASE_INITRC="$SRC/base-init.rc"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR cp "$CID:/system/etc/init/hw/init.rc" "$BASE_INITRC"
-$CTR rm "$CID" >/dev/null
-if ! diff <(grep -v 'ld_config.*\.patch\|# Patch ld.config after apexd\|^\s*$' "$HACKDIR/etc/init/hw/init.rc") \
-          <(grep -v '^\s*$' "$BASE_INITRC") >/dev/null; then
-    echo "错误: houdini_hack 的 init.rc 与基础镜像差异过大, 不能直接替换" >&2
-    diff "$BASE_INITRC" "$HACKDIR/etc/init/hw/init.rc" | head -20 >&2
-    exit 1
-fi
-install -Dm644 "$HACKDIR/etc/init/hw/init.rc"         "$HD/system/etc/init/hw/init.rc"
+copy_from_base /system/etc/init/hw/init.rc "$BASE_INITRC"
+mkdir -p "$HD/system/etc/init/hw"
+python3 - "$BASE_INITRC" "$HD/system/etc/init/hw/init.rc" <<'PYEOF'
+import sys
+from pathlib import Path
+
+src, dst = map(Path, sys.argv[1:])
+text = src.read_text()
+anchor = "    perform_apex_config\n"
+marker = "    # redroid-graft: patch Houdini linker namespaces after apexd\n"
+commands = (
+    marker
+    + '    exec -- /system/bin/sh -c "/system/bin/patch '
+      '/linkerconfig/ld.config.txt < /system/etc/ld_config.patch"\n'
+    + '    exec -- /system/bin/sh -c "/system/bin/patch '
+      '/linkerconfig/com.android.media.swcodec/ld.config.txt '
+      '< /system/etc/ld_config_swcodec.patch"\n'
+)
+if marker in text or "ld_config_swcodec.patch" in text:
+    raise SystemExit("基础镜像 init.rc 已含未知的 ld.config 补丁，拒绝重复注入")
+if text.count(anchor) != 1:
+    raise SystemExit(
+        f"init.rc 中应恰有一个 perform_apex_config 锚点，实际 {text.count(anchor)}"
+    )
+dst.write_text(text.replace(anchor, anchor + "\n" + commands, 1))
+print("patched parent init.rc after perform_apex_config")
+PYEOF
+chmod 0644 "$HD/system/etc/init/hw/init.rc"
 
 tar --owner=0 --group=0 --numeric-owner -cf "$OUT/houdini.tar" -C "$HD" system
+
+# 验证归档内容，而不只验证 staging 文件。
+if [ "$PATCH_HOUDINI_EXPIRY" = 1 ]; then
+    EXPECT_H32="96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993"
+    EXPECT_H64="847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8"
+else
+    EXPECT_H32="f8df8ff7e4894feec7876135f88cb9b9f3e3c9a4221c909c9b45c35bc02f9866"
+    EXPECT_H64="b321439df5a64ff29a62bb168303e58f800e94113c399f52795c42793f7f5f1e"
+fi
+for spec in "system/lib/libhoudini.so:$EXPECT_H32" \
+            "system/lib64/libhoudini.so:$EXPECT_H64"; do
+    member=${spec%%:*}; expected=${spec#*:}
+    actual=$(tar -xOf "$OUT/houdini.tar" "$member" | sha256sum | cut -d' ' -f1)
+    [ "$actual" = "$expected" ] || {
+        echo "错误: houdini.tar 中 $member 的 SHA-256 不符" >&2; exit 1; }
+done
+msg "houdini.tar 双 ABI SHA-256 校验通过"
 
 ########################################
 # 2. Magisk（可选）
@@ -234,16 +307,9 @@ chmod 0755 "$MGDIR/install_app.sh"
 
 MAGISKSYSTEMDIR=/system/etc/init/magisk
 MAGISKTMP=/sbin
-cat > "$MG/system/etc/init/bootanim.rc" <<EOF
-service bootanim /system/bin/bootanimation
-    class core animation
-    user graphics
-    group graphics audio
-    disabled
-    oneshot
-    ioprio rt 0
-    task_profiles MaxPerformance
-
+# Android init 会加载 /system/etc/init/*.rc；把 Magisk trigger 放在独立文件，
+# 不覆盖父镜像的 bootanim 服务定义。
+cat > "$MG/system/etc/init/magisk.rc" <<EOF
 on post-fs-data
     start logd
     exec u:r:su:s0 root root -- $MAGISKSYSTEMDIR/magiskpolicy --live --magisk
@@ -270,7 +336,7 @@ on property:init.svc.zygote=restarting
 on property:init.svc.zygote=stopped
     exec u:r:su:s0 root root -- $MAGISKTMP/magisk --auto-selinux --zygote-restart
 EOF
-chmod 0644 "$MG/system/etc/init/bootanim.rc"
+chmod 0644 "$MG/system/etc/init/magisk.rc"
 
 # magisk 目录 owner 2000(shell):0
 tar --numeric-owner --owner=0 --group=0 \
@@ -285,10 +351,13 @@ fi
 msg "生成 build.prop 覆盖层"
 PR="$SRC/props"
 mkdir -p "$PR/vendor" "$PR/system"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR cp "$CID:/vendor/build.prop" "$PR/vendor/build.prop"
-$CTR cp "$CID:/system/build.prop" "$PR/system/build.prop"
-$CTR rm "$CID" >/dev/null
+copy_from_base /vendor/build.prop "$PR/vendor/build.prop"
+copy_from_base /system/build.prop "$PR/system/build.prop"
+if ! grep -qx 'ro.hardware.gralloc=minigbm_gbm_mesa' "$PR/vendor/build.prop" ||
+   ! grep -qx 'ro.hardware.egl=mesa' "$PR/vendor/build.prop"; then
+    echo "错误: BASE_IMAGE 不是已嫁接 gralloc4/Mesa 的底图: $BASE_IMAGE" >&2
+    exit 1
+fi
 
 python3 - "$PR" <<'PYEOF'
 import sys, os, re

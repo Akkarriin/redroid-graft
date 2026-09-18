@@ -15,21 +15,82 @@ CTR=${CTR:-podman}
 
 WD_VENDOR_URL="https://sourceforge.net/projects/waydroid/files/images/vendor/waydroid_x86_64/lineage-20.0-20260428-MAINLINE-waydroid_x86_64-vendor.zip/download"
 WD_VENDOR_ZIP="$DL/waydroid-vendor.zip"
+WD_VENDOR_SHA="cba35433ffca73ed349e096b1daec495b3204e01c0e541c4203671e6d648e874"
 
-# 先打图形栈底图; houdini/Magisk 由 build.sh 叠在这之上
-BASE_IMAGE="${BASE_IMAGE:-docker.io/redroid/redroid:13.0.0-latest}"
+# 先打图形栈底图; houdini/Magisk 由 build.sh 叠在这之上。
+# graft 只支持 x86_64，默认锁定该 tag 当前的 amd64 manifest digest。
+BASE_IMAGE="${BASE_IMAGE:-docker.io/redroid/redroid:13.0.0-latest@sha256:524987f1fc489f6018e2c9d0dd622e5eccea13eb896417cb4bfb26bc3fea9afd}"
 NEW_IMAGE="${NEW_IMAGE:-localhost/redroid13-graft:latest}"
+
+if [ -z "${VULKAN_HW:-}" ]; then
+    if [ -n "${VK_DRIVERS:-}" ]; then
+        first_driver=${VK_DRIVERS%% *}
+        VULKAN_HW=${first_driver#vulkan.}
+        VULKAN_HW=${VULKAN_HW%.so}
+    else
+        VULKAN_HW=intel
+    fi
+fi
+if [ -z "${VK_DRIVERS:-}" ]; then
+    if [ "$VULKAN_HW" = intel ]; then
+        VK_DRIVERS="vulkan.intel.so vulkan.intel_hasvk.so"
+    else
+        VK_DRIVERS="vulkan.${VULKAN_HW}.so"
+    fi
+fi
+[[ "$VULKAN_HW" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "VULKAN_HW 含非法字符: $VULKAN_HW" >&2; exit 1; }
+for driver in $VK_DRIVERS; do
+    [[ "$driver" =~ ^vulkan\.[A-Za-z0-9_.-]+\.so$ ]] || {
+        echo "VK_DRIVERS 中的文件名非法: $driver" >&2; exit 1; }
+done
+case " $VK_DRIVERS " in
+    *" vulkan.${VULKAN_HW}.so "*) ;;
+    *) echo "VK_DRIVERS 不含 VULKAN_HW 对应的 vulkan.${VULKAN_HW}.so" >&2; exit 1 ;;
+esac
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
 
+fetch() { # url sha256 dest
+    local url=$1 sha=$2 dest=$3 tmp="${3}.part"
+    if [ -f "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
+        msg "已缓存并校验 $(basename "$dest")"
+        return
+    fi
+    msg "下载 $(basename "$dest")"
+    rm -f "$tmp"
+    curl -fL --retry 3 -o "$tmp" "$url"
+    [ "$(sha256sum "$tmp" | cut -d' ' -f1)" = "$sha" ] || {
+        rm -f "$tmp"; echo "sha256 校验失败: $dest" >&2; exit 1; }
+    mv -f "$tmp" "$dest"
+}
+
+copy_from_base() { # path-in-image dest
+    local src=$1 dest=$2 cid
+    cid=$($CTR create "$BASE_IMAGE")
+    if ! $CTR cp "$cid:$src" "$dest"; then
+        $CTR rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    $CTR rm "$cid" >/dev/null
+}
+
+export_base_filelist() { # dest
+    local dest=$1 cid
+    cid=$($CTR create "$BASE_IMAGE")
+    if ! $CTR export "$cid" 2>/dev/null | tar tf - > "$dest" 2>/dev/null; then
+        $CTR rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    $CTR rm "$cid" >/dev/null
+}
+
 mkdir -p "$DL" "$OUT"
+rm -f "$OUT/gralloc4.tar" "$OUT/Dockerfile.gralloc4"
 rm -rf "$SRC"; mkdir -p "$SRC/vendor/lib64/hw" "$SRC/vendor/bin/hw" \
                         "$SRC/vendor/etc/init" "$SRC/vendor/etc/vintf/manifest"
 
-if [ ! -f "$WD_VENDOR_ZIP" ]; then
-    msg "下载 Waydroid vendor 镜像"
-    curl -fL --retry 3 -o "$WD_VENDOR_ZIP" "$WD_VENDOR_URL"
-fi
+fetch "$WD_VENDOR_URL" "$WD_VENDOR_SHA" "$WD_VENDOR_ZIP"
 
 msg "解包 vendor.img"
 VIMG="$SRC/vendor.img"
@@ -82,7 +143,6 @@ done
 # 只带 intel(Arc/核显)。曾打包全厂商驱动 + detect_gpu 自动选；
 # Settings 崩后来证实与此无关（见 TROUBLESHOOTING §7 的 map_stride 补丁），
 # 现保持 Intel-only 以减小面。
-VK_DRIVERS="${VK_DRIVERS:-vulkan.intel.so vulkan.intel_hasvk.so}"
 for l in $VK_DRIVERS; do
     ex "lib64/hw/$l" "$SRC/vendor/lib64/hw/$l"
 done
@@ -200,9 +260,7 @@ chmod 0644 "$SRC/vendor/etc/init/"*.rc
 # 主 manifest: 移除 allocator@2.0 / mapper@2.1 声明
 ########################################
 msg "改写 vendor manifest.xml"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR cp "$CID:/vendor/etc/vintf/manifest.xml" "$SRC/manifest.xml.orig"
-$CTR rm "$CID" >/dev/null
+copy_from_base /vendor/etc/vintf/manifest.xml "$SRC/manifest.xml.orig"
 
 python3 - "$SRC/manifest.xml.orig" "$SRC/vendor/etc/vintf/manifest.xml" <<'PYEOF'
 import re, sys
@@ -224,16 +282,14 @@ chmod 0644 "$SRC/vendor/etc/vintf/manifest.xml"
 ########################################
 msg "生成属性覆盖"
 mkdir -p "$SRC/props"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR cp "$CID:/vendor/build.prop" "$SRC/props/build.prop"
-$CTR rm "$CID" >/dev/null
+copy_from_base /vendor/build.prop "$SRC/props/build.prop"
 
-python3 - "$SRC/props/build.prop" <<'PYEOF'
+python3 - "$SRC/props/build.prop" "$VULKAN_HW" <<'PYEOF'
 import re, sys
-p = sys.argv[1]
+p, vulkan_hw = sys.argv[1:]
 props = {
     "ro.hardware.gralloc": "minigbm_gbm_mesa",
-    "ro.hardware.vulkan": "intel",
+    "ro.hardware.vulkan": vulkan_hw,
     "ro.hardware.egl": "mesa",
 }
 lines = open(p).read().splitlines()
@@ -268,9 +324,7 @@ msg "gralloc4.tar 就绪"
 ########################################
 msg "校验依赖闭包"
 BASE_LIST="$SRC/base.filelist"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR export "$CID" 2>/dev/null | tar tf - > "$BASE_LIST" 2>/dev/null || true
-$CTR rm "$CID" >/dev/null
+export_base_filelist "$BASE_LIST"
 
 MISSING=0
 for B in lib lib64; do

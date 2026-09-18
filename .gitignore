@@ -11,6 +11,8 @@ scripts/out/
 *.apk
 *.so
 *.dex
+__pycache__/
+*.pyc
 
 # 编辑器 / 系统
 .DS_Store

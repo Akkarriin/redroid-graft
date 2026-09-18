@@ -2,4 +2,4 @@
 *.sh text eol=lf
 *.py text eol=lf
 *.md text eol=lf
-*.patch text eol=lf
+*.patch text eol=lf whitespace=-trailing-space

@@ -57,18 +57,31 @@ case "$BASE_IMAGE" in
 esac
 
 fetch() {
-    local url=$1 sha=$2 dest=$3
+    local url=$1 sha=$2 dest=$3 tmp="${3}.part"
     if [ -f "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ]; then
         msg "已缓存 $(basename "$dest")"
         return
     fi
     msg "下载 $(basename "$dest")"
-    curl -fL --retry 3 -o "$dest" "$url"
-    [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sha" ] || {
-        echo "sha256 校验失败: $dest" >&2; exit 1; }
+    rm -f "$tmp"
+    curl -fL --retry 3 -o "$tmp" "$url"
+    [ "$(sha256sum "$tmp" | cut -d' ' -f1)" = "$sha" ] || {
+        rm -f "$tmp"; echo "sha256 校验失败: $dest" >&2; exit 1; }
+    mv -f "$tmp" "$dest"
+}
+
+copy_from_base() { # path-in-image dest
+    local src=$1 dest=$2 cid
+    cid=$($CTR create "$BASE_IMAGE")
+    if ! $CTR cp "$cid:$src" "$dest"; then
+        $CTR rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    $CTR rm "$cid" >/dev/null
 }
 
 mkdir -p "$DL" "$OUT"
+rm -f "$OUT/ndk.tar" "$OUT/Dockerfile.ndk"
 rm -rf "$SRC"; mkdir -p "$SRC/layer" "$SRC/extract"
 
 fetch "$NDK_URL" "$NDK_SHA" "$NDK_ZIP"
@@ -109,10 +122,15 @@ chmod 0644 "$SRC/layer/system/etc/init/houdini.rc"
 # 属性: 对齐 wh-extensions prop.json，但只改 bridge 相关键
 msg "patch build.prop（保留图形栈属性）"
 mkdir -p "$SRC/layer/vendor" "$SRC/layer/system"
-CID=$($CTR create "$BASE_IMAGE")
-$CTR cp "$CID:/vendor/build.prop" "$SRC/layer/vendor/build.prop"
-$CTR cp "$CID:/system/build.prop" "$SRC/layer/system/build.prop"
-$CTR rm "$CID" >/dev/null
+copy_from_base /vendor/build.prop "$SRC/layer/vendor/build.prop"
+copy_from_base /system/build.prop "$SRC/layer/system/build.prop"
+
+# 镜像名可能被改过，不能只靠 *houdini* 名称判断冲突。
+if grep -qx 'ro.dalvik.vm.native.bridge=libhoudini.so' "$SRC/layer/vendor/build.prop" &&
+   [ "${FORCE_ON_HOUDINI:-0}" != 1 ]; then
+    echo "错误: BASE_IMAGE 的实际 native bridge 是 Houdini，拒绝叠加 NDK" >&2
+    exit 1
+fi
 
 python3 - "$SRC/layer" <<'PY'
 import os, re, sys
