@@ -14,17 +14,7 @@ Vulkan-only 的手游（尤其是新版 Unity 游戏）直接黑屏或崩溃。
 > 典型收益：原先黑屏/闪退的 Vulkan-only Unity 游戏（如少女前线2、赛马娘）
 > 可以正常进入并渲染。
 
-### 原版 redroid 确实跑不了 Vulkan 游戏吗？
-
-确实跑不了——这一点我们对原版镜像（13.0.0-latest）做过拆解和双模式实机验证：
-
-| 模式 | 原版镜像里有什么 | 实际结果 |
-|---|---|---|
-| host（GPU 加速） | Mesa Vulkan 驱动文件俱全，但 gralloc 停在 2.0 | Vulkan 拿不到 swapchain buffer（`dequeueBuffer -22`）→ Vulkan-only 游戏黑屏 |
-| guest（纯软件） | SwiftShader 软件 Vulkan | 交换链每帧报同步原语错误，全程 CPU 软渲，无实用价值 |
-
-另外原版自带 Mesa 24.0.8 已明显过时——在较新的 GPU 上连 SurfaceFlinger 都起不来。
-验证细节见 [TROUBLESHOOTING 附录 A](docs/TROUBLESHOOTING.md)。
+原版为什么跑不了，完整验证记录见 [TROUBLESHOOTING 附录 A](docs/TROUBLESHOOTING.md)。
 
 本仓库**只含构建脚本和文档**。Waydroid vendor、houdini、Magisk、GApps
 等第三方二进制在构建时下载，不入库。`scripts/dl/`、`scripts/src/`、
