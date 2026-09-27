@@ -1,13 +1,18 @@
 # redroid-graft
 
-把 [Waydroid](https://github.com/waydroid/waydroid) 的现代图形栈**嫁接**到
-[redroid](https://github.com/remote-android/redroid-doc) 上，再加上 ARM 翻译和 Root。
+**让 [redroid](https://github.com/remote-android/redroid-doc) 跑起需要 Vulkan 支持的游戏。**
 
-面向的场景：在 Linux 服务器 / NAS 上用 Docker 多开 Android 实例挂机手游，用 scrcpy 看画面。
+redroid 是很好的容器化 Android 方案（无头、多开、adb 直连），但它的图形栈
+停留在 gralloc 2.0 + 旧版 Mesa，Vulkan 应用拿不到 swapchain buffer——
+Vulkan-only 的手游（尤其是新版 Unity 游戏）直接黑屏或崩溃。
 
-> 名字里的 *graft*（嫁接）就是这个项目的方法论：
-> redroid 的容器化骨架 + Waydroid 的 gralloc4/Mesa 26 图形栈，
-> 两者同为 Android 13 / x86_64，ABI 兼容，直接搬运二进制即可。
+本项目把 [Waydroid](https://github.com/waydroid/waydroid) 的现代图形栈
+**嫁接**（*graft*）到 redroid 上：gralloc4（minigbm_gbm_mesa）+ Mesa 26，
+让 Vulkan 游戏在容器里正常渲染。两者同为 Android 13 / x86_64，ABI 兼容，
+直接搬运二进制即可。在此之上还顺带补齐了 ARM 翻译、Root 和 GApps。
+
+> 典型收益：原先黑屏/闪退的 Vulkan-only Unity 游戏（如少女前线2、赛马娘）
+> 可以正常进入并渲染。
 
 本仓库**只含构建脚本和文档**。Waydroid vendor、houdini、Magisk、GApps
 等第三方二进制在构建时下载，不入库。`scripts/dl/`、`scripts/src/`、
@@ -15,22 +20,16 @@
 
 ## 解决了什么
 
-redroid 是很好的容器化 Android 方案（无头、多开、adb 直连），但开箱跑不了很多手游：
-
 | 问题 | 表现 | 本项目的处理 |
 |---|---|---|
+| **gralloc 只有 2.0，Mesa 过旧** | **Vulkan-only 的 Unity 游戏黑屏/崩溃** | **移植 Waydroid 的 gralloc4 + Mesa 26** |
 | 只有 x86 指令集 | ARM-only 的游戏装不上/闪退 | 注入 libhoudini |
 | linker 命名空间限制 | houdini 加载 `libtcb.so` 被拒 → SIGABRT | 打 ld.config 补丁 |
 | Houdini 内置有效期 | 到期后游戏卡死、CPU 满载 | 构建时严格校验并移除 32/64 位到期分支 |
 | 无 root | 很多工具/脚本用不了 | 注入 Kitsune Magisk |
-| **gralloc 只有 2.0** | **Vulkan-only 的 Unity 游戏黑屏/崩溃** | **移植 Waydroid 的 gralloc4 + Mesa 26** |
 
-最后一项是核心。redroid 从 11 到 16 都只带 `graphics.allocator@2.0` 和 2024 年的 Mesa，
-Vulkan 应用拿不到 swapchain buffer。本项目把 Waydroid（LineageOS 20）的整套现代图形栈
-移植了过来，两者同为 Android 13 / x86_64，ABI 兼容。
-
-实测环境：Ubuntu + Intel Arc A380（xe 驱动），少女前线2（Unity 2019.4 IL2CPP，Vulkan-only）、
-赛马娘均可正常运行。
+第一项是核心。redroid 从 11 到 16 都只带 `graphics.allocator@2.0` 和 2024 年的 Mesa；
+图形栈嫁接完成后，Vulkan 游戏、ARM 翻译、Root 可以按需叠加。
 
 ### 为什么不直接用 Waydroid
 
@@ -79,7 +78,7 @@ Waydroid 本身就有完整的 gralloc4 + Vulkan，桌面上跑游戏没问题�
 | `redroid13-graft-ndk:latest` | 图形栈 + waydroid-helper ndk_translation（zork R136） |
 | `redroid13-graft-ndk-gapps:latest` | 图形栈 + zork NDK + MindTheGapps（无 Magisk） |
 | `redroid13-graft-ndk-stock-magisk:latest` | 诊断用：houdini-magisk 切回 redroid stock NDK |
-| `redroid13-graft-houdini-magisk:latest` | 图形栈 + houdini + Magisk（挂机手游常用） |
+| `redroid13-graft-houdini-magisk:latest` | 图形栈 + houdini + Magisk（手游常用） |
 | `redroid13-graft-houdini-magisk-gapps:latest` | 图形栈 + houdini + Magisk + MindTheGapps |
 
 `ROOT=none ./scripts/build.sh` 只要 houdini不要 Magisk。  
@@ -152,7 +151,7 @@ adb -s $D shell dumpsys gpu | grep -E 'vkLoading|vkDriverLoadingTime|appPackageN
 默认镜像只打包 Intel Vulkan（`vulkan.intel` / `intel_hasvk`），并设置
 `ro.hardware.vulkan=intel`。`VULKAN_HW` 与 `VK_DRIVERS` 可一起覆盖，脚本会用
 `VULKAN_HW` 生成属性，避免“打包 AMD 驱动却仍加载 Intel”的不一致。
-实测环境：Intel Arc A380（`xe`）。
+实测环境：Intel Arc A380（`xe` 内核驱动）。
 
 构建时会对 `libgbm_mesa_wrapper.so` 打补丁，跳过 allocate 时的 `gbm_bo_map`
 探测（否则进系统设置会拖死 `allocator@4`）。详见 [TROUBLESHOOTING §7](docs/TROUBLESHOOTING.md)。
