@@ -14,6 +14,18 @@ Vulkan-only 的手游（尤其是新版 Unity 游戏）直接黑屏或崩溃。
 > 典型收益：原先黑屏/闪退的 Vulkan-only Unity 游戏（如少女前线2、赛马娘）
 > 可以正常进入并渲染。
 
+### 原版 redroid 确实跑不了 Vulkan 游戏吗？
+
+确实跑不了——这一点我们对原版镜像（13.0.0-latest）做过拆解和双模式实机验证：
+
+| 模式 | 原版镜像里有什么 | 实际结果 |
+|---|---|---|
+| host（GPU 加速） | Mesa Vulkan 驱动文件俱全，但 gralloc 停在 2.0 | Vulkan 拿不到 swapchain buffer（`dequeueBuffer -22`）→ Vulkan-only 游戏黑屏 |
+| guest（纯软件） | SwiftShader 软件 Vulkan | 交换链每帧报同步原语错误，全程 CPU 软渲，无实用价值 |
+
+另外原版自带 Mesa 24.0.8 已明显过时——在较新的 GPU 上连 SurfaceFlinger 都起不来。
+验证细节见 [TROUBLESHOOTING 附录 A](docs/TROUBLESHOOTING.md)。
+
 本仓库**只含构建脚本和文档**。Waydroid vendor、houdini、Magisk、GApps
 等第三方二进制在构建时下载，不入库。`scripts/dl/`、`scripts/src/`、
 `scripts/out/` 已 gitignore，**请勿提交，也请勿公开分发构建出的镜像**。
@@ -146,12 +158,25 @@ adb -s $D shell dumpsys gpu | grep -E 'vkLoading|vkDriverLoadingTime|appPackageN
 
 没有 ashmem 的新内核要加 `androidboot.use_memfd=1`（多数情况都需要）。
 
+### 实测机器
+
+| 部件 | 配置 |
+|---|---|
+| 系统 | Ubuntu |
+| CPU | AMD 锐龙 7 5800 |
+| GPU | Intel Arc A380（`xe` 内核驱动） |
+
+在这台机器上验证通过：gralloc4 + Mesa 26 嫁接后 Vulkan 游戏正常渲染；
+**libhoudini ARM 翻译可以正常跑 ARM 手游**（含 32/64 位双 ABI）；
+Kitsune Magisk 与 MindTheGapps 叠加均正常。其他硬件理论上可行，
+`VULKAN_HW` / `VK_DRIVERS` 可调，但尚未实机验证。
+
 ### GPU 支持
 
 默认镜像只打包 Intel Vulkan（`vulkan.intel` / `intel_hasvk`），并设置
 `ro.hardware.vulkan=intel`。`VULKAN_HW` 与 `VK_DRIVERS` 可一起覆盖，脚本会用
 `VULKAN_HW` 生成属性，避免“打包 AMD 驱动却仍加载 Intel”的不一致。
-实测环境：Intel Arc A380（`xe` 内核驱动）。
+实测环境见上文「实测机器」。
 
 构建时会对 `libgbm_mesa_wrapper.so` 打补丁，跳过 allocate 时的 `gbm_bo_map`
 探测（否则进系统设置会拖死 `allocator@4`）。详见 [TROUBLESHOOTING §7](docs/TROUBLESHOOTING.md)。
@@ -247,7 +272,7 @@ NEW_IMAGE=myrepo/android:13 ./scripts/gralloc4.sh
 
 ## 已知限制
 
-- **只在 Intel Arc A380 + xe 驱动上实测过**。默认只打包 Intel Vulkan；
+- **只在「实测机器」一节列出的配置上完整验证过**。默认只打包 Intel Vulkan；
   AMD/NVIDIA 需设置 `VULKAN_HW` / `VK_DRIVERS`（尚未实机验证）。
 - 镜像约 2.5 GB（主要是 Mesa 26 的 `libLLVM22` 64/32 位各一份）。
 - 基于 redroid 13。更高版本 redroid 的 vendor 分区布局相同，

@@ -462,3 +462,32 @@ Intel-only 硬编码后照样崩；根因是 allocate 时的 `gbm_bo_map` 探测
 7. **游戏是否 Vulkan 看 `dumpsys gpu`，别看 gfxinfo 的 Skia 行**（见 §8）。
 8. **「能进设置」的旧容器未必带 Vulkan** — 先 `getprop ro.hardware.gralloc`
    区分 `gbm`（旧）和 `minigbm_gbm_mesa`（嫁接）。
+
+---
+
+## 附录 A：原版 redroid 的 Vulkan 能力验证记录
+
+"原版 redroid 跑不了需要 Vulkan 的游戏"不是猜测，验证分三步：
+
+**1. 拆解原版镜像（`redroid/redroid:13.0.0-latest`）**
+
+- vendor 里确实打了 Mesa Vulkan 驱动（`lib64/hw/vulkan.{intel,radeon,...}.so`）
+  和 Vulkan feature XML，gpu_config.sh 还会按 DRI 驱动设置 `ro.hardware.vulkan`
+- 但 gralloc 只有 `android.hardware.graphics.allocator@2.0`（gbm_gralloc），Mesa 版本为 24.0.8
+
+**2. host GPU 模式实机启动**
+
+- 在 Arc A380 上：SurfaceFlinger 能起，但 Vulkan 应用分配 swapchain buffer 失败
+  （`dequeueBuffer -22` + `mapper 4.x is not supported`，见 §4），Vulkan-only 游戏黑屏
+- 在新的 AMD GPU（RDNA4 世代）上：自带的 Mesa 24.0.8 太旧，连 gbm 设备都创建失败
+  （`GRALLOC-GBM: failed to create gbm device`），SurfaceFlinger 起不来，boot 卡死
+
+**3. guest（纯软件）模式实机启动**
+
+- SwiftShader Vulkan（pastel）可加载，`pm list features` 声明 Vulkan，
+  `debug.hwui.renderer=skiavk` 后设置界面确实走 `Skia (Vulkan)` 管线
+- 但交换链每帧报 `VulkanManager::swapBuffers(): Failed to get semaphore Fd`
+  （SwiftShader 不支持导出 sync fd），且全程 CPU 软渲——对游戏无实用价值
+
+**结论**：原版 redroid 对 Vulkan 的支持停留在"镜像里有驱动文件"的层面，
+两种模式下都拿不出可用的 GPU 加速 Vulkan 交换链。这正是本项目存在的原因。
