@@ -90,16 +90,16 @@ Waydroid 本身就有完整的 gralloc4 + Vulkan，桌面上跑游戏没问题�
 `SKIP_SETUP=0` 保留 Setup Wizard（默认写入 `ro.setupwizard.mode=DISABLED`）。
 
 两个脚本都会缓存下载内容到 `dl/`，重跑不会重复下载（共约 350 MB）。
-用 `CTR=docker` 切换容器引擎。
+构建默认用 podman（须以 root 运行，见下），`CTR=docker` 切换到 docker。
 
 运行（ARM 手游场景，用带 houdini 的变体）：
 
 ```bash
 docker run -itd --privileged \
     --name android-1 \
-    -v ~/redroid-data/1:/data \
+    -v /srv/redroid-data/1:/data \
     -p 5555:5555 \
-    redroid13-graft-houdini-magisk:latest \
+    localhost/redroid13-graft-houdini-magisk:latest \
     androidboot.use_memfd=1 \
     androidboot.redroid_gpu_mode=host \
     androidboot.redroid_fps=60 \
@@ -111,7 +111,56 @@ adb connect <IP>:5555
 scrcpy -s <IP>:5555 --max-fps=60
 ```
 
-多开就是改 `--name`、`-p` 和 `-v` 再跑一遍。
+镜像名要写全 `localhost/...`：脚本产出的镜像带 `localhost/` 前缀，docker 不会自动补
+（podman 会）。多开就是改 `--name`、`-p` 和 `-v` 再跑一遍。
+
+### 用 podman 运行
+
+把上面的 `docker run` 换成下面这样，其余参数不变：
+
+```bash
+sudo podman run -d --privileged --pids-limit=-1 \
+    --name android-1 \
+    -v /srv/redroid-data/1:/data \
+    -p 5555:5555 \
+    localhost/redroid13-graft-houdini-magisk:latest \
+    androidboot.use_memfd=1 androidboot.redroid_gpu_mode=host ...
+```
+
+和 docker 的差别：
+
+- **必须 `--pids-limit=-1`**。podman 默认每个容器限 2048 个任务（`containers.conf` 的
+  `pids_limit`），cgroup 按线程计数；Android 开机就有一两千个线程，再开游戏会
+  `pthread_create` 失败、进程随机崩溃。docker 默认不限制。
+- **必须 rootful**（`sudo podman` 或 root 用户）。rootless 的 `--privileged` 只在用户命名空间
+  内有效，redroid 开机要挂 debugfs（`gpu_config.sh` 靠它识别 GPU）、访问 binder 和
+  `/dev/dri`，都做不到。构建镜像和运行要用同一个用户，否则看不到镜像。
+- **开机自启**靠 systemd（podman 没有常驻守护进程，`--restart=always` 管不到重启宿主后）。
+  推荐 Quadlet（podman ≥ 4.4）：写入 `/etc/containers/systemd/android-1.container`
+
+  ```ini
+  [Unit]
+  Description=redroid-graft android-1
+
+  [Container]
+  Image=localhost/redroid13-graft-houdini-magisk:latest
+  ContainerName=android-1
+  PodmanArgs=--privileged
+  PidsLimit=-1
+  Volume=/srv/redroid-data/1:/data
+  PublishPort=5555:5555
+  Exec=androidboot.use_memfd=1 androidboot.redroid_gpu_mode=host androidboot.redroid_fps=60 androidboot.redroid_width=1080 androidboot.redroid_height=1920 androidboot.redroid_dpi=320
+
+  [Service]
+  Restart=always
+  TimeoutStartSec=300
+
+  [Install]
+  WantedBy=multi-user.target default.target
+  ```
+
+  然后 `sudo systemctl daemon-reload && sudo systemctl start android-1`。
+  多开就复制成 `android-2.container`，改 `ContainerName`、`Volume`、`PublishPort`。
 
 ### 验证安装结果
 
