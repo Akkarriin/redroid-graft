@@ -36,9 +36,28 @@ class Prepared:
 
 
 NOP6 = bytes.fromhex("90 90 90 90 90 90")
+# 每个 libhoudini.so 里恰有一处 "cmp <到期状态>, 2; jae <失败分支>"，
+# 改成 6 个 NOP。64 位偏移与 waydroid-helper 的 scripton.sh (issue #127) 一致；
+# 32 位是同一结构的对应位置（waydroid-helper 只补 64 位）。
 VARIANTS = (
     Variant(
-        name="HPE 14.0.0_y i386",
+        name="HPE 14.0.0_y.GoogleGame_com1.3 i386",
+        source_sha256="bfdad39a4b658fdd7e03f2638d6ec314a8983ec7ec2cd55def510d31958d8489",
+        patched_sha256="fa74f6f79ca55525e7ff057c03260ffa43eee905ea0320b5c2214829150452c8",
+        offset=0x8A27A,
+        original=bytes.fromhex("0f 83 0b 0d 00 00"),
+        replacement=NOP6,
+    ),
+    Variant(
+        name="HPE 14.0.0_z.GoogleGame_com1.3 x86_64",
+        source_sha256="5ef64035ec89bca3d5e33b9f3b6556f98f6c11d11957387d403ae4a4d7cc40ec",
+        patched_sha256="da7448b3531865034e0e36425f18c4b55bf70f632518a272d469804370c13232",
+        offset=0xE61D5,
+        original=bytes.fromhex("0f 83 68 0d 00 00"),
+        replacement=NOP6,
+    ),
+    Variant(
+        name="HPE 14.0.0_y.GoogleGame_com1.2 i386",
         source_sha256="f8df8ff7e4894feec7876135f88cb9b9f3e3c9a4221c909c9b45c35bc02f9866",
         patched_sha256="96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993",
         offset=0x8A29A,
@@ -46,7 +65,7 @@ VARIANTS = (
         replacement=NOP6,
     ),
     Variant(
-        name="HPE 14.0.0_z x86_64",
+        name="HPE 14.0.0_z.GoogleGame_com1.2 x86_64",
         source_sha256="b321439df5a64ff29a62bb168303e58f800e94113c399f52795c42793f7f5f1e",
         patched_sha256="847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8",
         offset=0xE6085,

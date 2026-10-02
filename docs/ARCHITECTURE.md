@@ -188,10 +188,18 @@ apex 未展开时自动解包）。旧检查只看文件名是否在 `system/` �
 
 ### houdini.tar — ARM 翻译
 
-来源：`supremegamers/vendor_intel_proprietary_houdini` 的固定 commit
-`debc3dc91cf12b5c5b8a1c546a5b0b7bf7f838a8`（Google Play Games for PC
-的 HPE 镜像）。32 位库为 `14.0.0_y.GoogleGame_com1.2`，64 位库为
-`14.0.0_z.GoogleGame_com1.2`。
+来源：`supremegamers/vendor_intel_proprietary_houdini` 的 `hpe-14` 分支，与
+[waydroid-helper extensions](https://github.com/waydroid-helper/extensions) 的
+`houdini-hpe-14` 条目对齐（commit 与 zip SHA 相同）。`HOUDINI_VERSION` 选择：
+
+| `HOUDINI_VERSION` | commit | 来源镜像 | 库版本 |
+|---|---|---|---|
+| `1.3`（默认） | `2f8f0886…`（2026-09） | HPE UKW1.260829.001 | `14.0.0_{y,z}.GoogleGame_com1.3` |
+| `1.2` | `debc3dc9…`（2026-01） | Google Play Games PC UKW1.251130.001 | `14.0.0_{y,z}.GoogleGame_com1.2` |
+
+1.2 在「实测机器」上验证过；1.3 是 waydroid-helper 当前的最新条目，未实机验证。
+1.3 的 32/64 位 `libhoudini.so` 均有变化；目录结构不变（新增的
+`prebuilts/etc/init/houdini.rc` 会被下面生成的 rc 覆盖）。
 
 ```
 system/bin/houdini, houdini64
@@ -210,13 +218,21 @@ system/etc/init/houdini.rc
 HPE 库内置有效期；到期后不是正常退出，而是进入异常路径，表现为 ARM 游戏卡死、
 CPU 满载。`scripts/patch-houdini-expiry.py` 在打包前同时处理两种 ABI：
 
-| 路径 | 原 SHA256 | 偏移 / 原字节 | 补丁后 SHA256 |
+| 版本 / 路径 | 原 SHA256 | 偏移 / 原字节 | 补丁后 SHA256 |
 |---|---|---|---|
-| `system/lib/libhoudini.so` | `f8df8ff7…2f9866` | `0x8a29a` / `0f830b0d0000` | `96fe3acc…4e993` |
-| `system/lib64/libhoudini.so` | `b321439d…5f1e` | `0xe6085` / `0f83680d0000` | `847be255…23b8` |
+| 1.3 `system/lib/libhoudini.so` | `bfdad39a…d8489` | `0x8a27a` / `0f830b0d0000` | `fa74f6f7…452c8` |
+| 1.3 `system/lib64/libhoudini.so` | `5ef64035…c40ec` | `0xe61d5` / `0f83680d0000` | `da7448b3…13232` |
+| 1.2 `system/lib/libhoudini.so` | `f8df8ff7…2f9866` | `0x8a29a` / `0f830b0d0000` | `96fe3acc…4e993` |
+| 1.2 `system/lib64/libhoudini.so` | `b321439d…5f1e` | `0xe6085` / `0f83680d0000` | `847be255…23b8` |
 
-两条 `jae` 均替换为 6 个 NOP，完全绕过到期后的失败分支，而不是把日期延长到
-另一个年份。补丁器同时检查压缩包 SHA、单文件完整 SHA、原指令和补丁后 SHA；
+每个库里恰有一处 `cmp <到期状态>, 2; jae <失败分支>`（库导出 `ibt_get_expire_date`，
+代码经 Maze 控制流混淆），该 `jae` 替换为 6 个 NOP，完全绕过到期后的失败分支，
+而不是把日期延长到另一个年份。独立的 `houdini`/`houdini64` 可执行文件里没有这段检查。
+
+与 waydroid-helper 的对照：它的 `scripton.sh`（依据 waydroid-helper issue #127）
+只补 64 位，偏移与这里完全相同（1.2：`0xe6085`，1.3：`0xe61d5`）。32 位库有同构的
+检查，waydroid-helper 没补，32 位 ARM（armeabi-v7a）游戏在它那边仍会到期；
+这里两种 ABI 都补。补丁器同时检查压缩包 SHA、单文件完整 SHA、原指令和补丁后 SHA；
 未知版本会失败退出，绝不按偏移盲打。重复运行是幂等的，且 `houdini.tar` 内的两个
 成员会再次校验。`PATCH_HOUDINI_EXPIRY=0` 可保留原版行为用于负对照。
 
@@ -277,14 +293,23 @@ Android init 会加载 `/system/etc/init/*.rc`，无需重写父镜像的 `boota
 2. **stub 壳问题**（详见 TROUBLESHOOTING.md #1）。magiskd 在 `--boot-complete`
    发现 app 未安装时，会自己拿 `stub.apk` 装个 41KB 的壳（versionName=1.0），
    而壳要联网下载完整版，Kitsune 上游地址已 404 → `System.exit(0)` 自杀。
-   而且 **magiskd 装壳的时机可能晚于 magisk.rc 的首次检查**，所以一次性检查会被覆盖。
-   处理方式：`install_app.sh` 用 `exec_background` 后台持续监视两分钟，
-   每 2 秒查一次 versionName，发现是 `1.0`（壳）或未安装就重装完整版
+   根因在 magiskd：`--setup-sbin` 把 `stub.apk` 拷进 `/sbin`，`post-fs-data` 时
+   `preserve_stub_apk()` 打开它；`--boot-complete` 时找不到管理器 app 就 `install_stub()`。
+   而 `install_stub()` 在没有 `stub.apk` 时直接返回。
+   处理方式：
+   - **Kitsune（默认）**：镜像里不放 `stub.apk`，magiskd 无壳可装；`install_app.sh`
+     装好完整版即退出。基准证书为空时 Kitsune 不做签名比对，不会误删完整版；
+     "隐藏 Magisk 应用"用 APK 自带的 `assets/stub.apk`，不受影响。
+   - **官方 Magisk（`ROOT=magisk`）**：v30.7 在非 debug 构建下会以 stub 证书为基准、
+     证书不符就卸载 app，无法确认预编译 APK 的构建类型，所以仍放 `stub.apk`，
+     由 `install_app.sh` 后台监视两分钟、发现壳就盖回。
+   - 上游没有修：ayasa520 的 `patch-1` 分支（来自 mistrmochov/KitsuneMagisk-Waydroid）
+     只是把壳的下载地址改到另一个第三方的 GitHub Release，开机后会从那里下载 APK，不采用。
 
 #### PID > 32768
 
-Kitsune `ea3f64a` 源码用固定 `bitset<32768>` 追踪 PID，而现代内核的
-`pid_max` 往往更高。`patches/kitsune-pid-set-dynamic.patch` 已在完整 commit
+Kitsune `ea3f64a` 源码用固定 `bitset<32768>` 追踪 PID（MagiskHide 的 ptrace 监视器），
+而 redroid 自己会把 `pid_max` 设成 65535。上游所有分支都没修（见 README）。`patches/kitsune-pid-set-dynamic.patch` 已在完整 commit
 `ea3f64a97757506707136ff88b0ec730574cae42` 上重生成，改为按已见最高 PID
 动态增长的 packed bitmap（O(1)，无逐节点分配）。但 `build.sh` 默认下载的是上游
 预编译 APK，**不会自动带上源码补丁**；长期运行且 PID 可能超过 32768 时，应自编译后通过

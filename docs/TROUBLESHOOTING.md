@@ -30,7 +30,7 @@ I .huskydg.magisk: System.exit called, status: 0
 **原因** — 装成了 41KB 的 stub 壳。壳要联网下载完整版，
 Kitsune 上游地址已 404，于是自杀退出。
 
-**这个问题修了三次**，前两次都没看到真正的因果，值得记下来：
+**这个问题修了四次**，前几次都没看到真正的因果，值得记下来：
 
 **第一版**：复制到 `/data/adb/magisk` 时排除 `stub.apk`。
 → 无效，因为装壳的根本不是那条路径。
@@ -69,8 +69,16 @@ done
 
 **实测验证**：手动装上 stub 后，8 秒内被监视脚本自动覆盖回完整版。
 
+**第四版（现行，Kitsune）**：读 magiskd 源码找到触发点——`--setup-sbin` 把
+`/system/etc/init/magisk/stub.apk` 拷进 `/sbin`，`preserve_stub_apk()` 打开后删掉文件，
+`--boot-complete` 时 `get_manager(..., install=true)` 找不到 app 就 `install_stub()`，
+而它在 `stub_apk_fd < 0` 时直接返回。所以干脆不往镜像里放 `stub.apk`：magiskd 无壳可装，
+`install_app.sh` 装好完整版就退出。这也解释了第一版为什么无效——它排除的是
+`/data/adb/magisk` 里的副本，magiskd 用的是 `/sbin` 那份。
+官方 Magisk（`ROOT=magisk`）仍走第三版的监视（原因见 ARCHITECTURE）。
+
 > 教训：对于"有另一个守护进程也在操作同一资源"的情况，
-> 一次性检查不够。要么找到它的触发点精确插入，要么就持续监视。
+> 一次性检查不够。要么找到它的触发点精确插入（第四版），要么就持续监视（第三版）。
 > 先前两次失败都是因为只看到"现象消失了"就以为修好了，
 > 没验证它会不会被重新触发。
 
@@ -144,9 +152,11 @@ adb shell "grep -c arm64 /linkerconfig/ld.config.txt"   # >0 即生效
 
 ```bash
 adb shell sha256sum /system/lib/libhoudini.so
-# 96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993
+# com1.3 (默认): fa74f6f79ca55525e7ff057c03260ffa43eee905ea0320b5c2214829150452c8
+# com1.2:        96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993
 adb shell sha256sum /system/lib64/libhoudini.so
-# 847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8
+# com1.3 (默认): da7448b3531865034e0e36425f18c4b55bf70f632518a272d469804370c13232
+# com1.2:        847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8
 ```
 
 若构建报 `unsupported libhoudini.so SHA-256`，说明上游二进制已变化或缓存损坏。
@@ -422,8 +432,9 @@ podman create docker.io/redroid/redroid:15.0.0-latest
 镜像里那个 `gralloc.cros.so` 是残缺的，切过去连系统 UI 都分配不出 buffer
 （`createGraphicBuffer failed`），system_server 崩溃，adb 断连。
 
-**换更高版本 libhoudini** — 已经是最高。
-上游 `hpe-14` 分支 2026-01 的新 commit，houdini 二进制 md5 与现用版本完全相同。
+**换更高版本 libhoudini** — 2026-09 上游 `hpe-14` 出了 com1.3（`2f8f0886`，
+waydroid-helper 已跟进），现为默认；com1.2 可用 `HOUDINI_VERSION=1.2` 回退。
+两者都带时间炸弹，都需要补丁。
 `aow-13` 分支是**倒退**（13.0.1_z vs 14.0.0_z），实测导致赛马娘 SIGFPE 崩溃。
 
 **换 libndk_translation** — 与图形无关。

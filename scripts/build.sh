@@ -26,9 +26,30 @@ case "$PATCH_HOUDINI_EXPIRY" in
     *) echo "PATCH_HOUDINI_EXPIRY 只支持 0 或 1" >&2; exit 1 ;;
 esac
 
-HOUDINI_COMMIT="debc3dc91cf12b5c5b8a1c546a5b0b7bf7f838a8"
+# 与 waydroid-helper extensions 的 houdini-hpe-14 条目对齐
+# (arm_translation/houdini/houdini-hpe-14/*/EXTENSION; zip SHA 取自其 sha256sums)。
+# EXPECT_*: houdini.tar 内 32/64 位 libhoudini.so 的最终 SHA（补丁后 / 原版）。
+HOUDINI_VERSION="${HOUDINI_VERSION:-1.3}"
+case "$HOUDINI_VERSION" in
+    1.3)  # HPE UKW1.260829.001, hpe-14 分支 2026-09
+        HOUDINI_COMMIT="2f8f088671182e17e67321e098e8411a3972a628"
+        HOUDINI_SHA="2e82cdc88ddc4d418f7fb861aeebb7c49c83a91b97f57da10510b5e1146a4ed5"
+        PATCHED_H32="fa74f6f79ca55525e7ff057c03260ffa43eee905ea0320b5c2214829150452c8"
+        PATCHED_H64="da7448b3531865034e0e36425f18c4b55bf70f632518a272d469804370c13232"
+        ORIG_H32="bfdad39a4b658fdd7e03f2638d6ec314a8983ec7ec2cd55def510d31958d8489"
+        ORIG_H64="5ef64035ec89bca3d5e33b9f3b6556f98f6c11d11957387d403ae4a4d7cc40ec"
+        ;;
+    1.2)  # Google Play Games PC UKW1.251130.001, 2026-01; 实机验证过的旧版
+        HOUDINI_COMMIT="debc3dc91cf12b5c5b8a1c546a5b0b7bf7f838a8"
+        HOUDINI_SHA="7c78abbcced1f7c5c1cc794a0afb4010a2e5bb0bb18eadd6de3af2fe13e9dc25"
+        PATCHED_H32="96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993"
+        PATCHED_H64="847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8"
+        ORIG_H32="f8df8ff7e4894feec7876135f88cb9b9f3e3c9a4221c909c9b45c35bc02f9866"
+        ORIG_H64="b321439df5a64ff29a62bb168303e58f800e94113c399f52795c42793f7f5f1e"
+        ;;
+    *) echo "HOUDINI_VERSION 只支持 1.3 或 1.2" >&2; exit 1 ;;
+esac
 HOUDINI_URL="https://github.com/supremegamers/vendor_intel_proprietary_houdini/archive/${HOUDINI_COMMIT}.zip"
-HOUDINI_SHA="7c78abbcced1f7c5c1cc794a0afb4010a2e5bb0bb18eadd6de3af2fe13e9dc25"
 
 # linker 命名空间补丁: 默认 /system/lib64/arm64 不在 permitted.paths 里,
 # libhoudini.so dlopen libtcb.so 会被 linker 拒绝 → arm 应用 SIGABRT
@@ -110,7 +131,7 @@ rm -f "$OUT/houdini.tar" "$OUT/magisk.tar" "$OUT/strip-su.tar" \
       "$OUT/props.tar" "$OUT/Dockerfile"
 rm -rf "$SRC"; mkdir -p "$SRC"
 
-fetch "$HOUDINI_URL" "$HOUDINI_SHA" "$DL/houdini.zip"
+fetch "$HOUDINI_URL" "$HOUDINI_SHA" "$DL/houdini-$HOUDINI_COMMIT.zip"
 fetch "$HACK_URL" "$HACK_SHA" "$DL/houdini_hack.zip"
 if [ "$ROOT" != none ]; then
     if [ -n "${MAGISK_LOCAL_APK:-}" ]; then
@@ -129,9 +150,9 @@ fi
 ########################################
 # 1. libhoudini
 ########################################
-msg "组装 libhoudini"
+msg "组装 libhoudini (HPE 14 com$HOUDINI_VERSION)"
 HD="$SRC/houdini"
-unzip -q "$DL/houdini.zip" -d "$SRC/houdini-zip"
+unzip -q "$DL/houdini-$HOUDINI_COMMIT.zip" -d "$SRC/houdini-zip"
 mkdir -p "$HD/system"
 cp -a "$SRC/houdini-zip/vendor_intel_proprietary_houdini-$HOUDINI_COMMIT/prebuilts/." "$HD/system/"
 
@@ -218,11 +239,9 @@ tar --owner=0 --group=0 --numeric-owner -cf "$OUT/houdini.tar" -C "$HD" system
 
 # 验证归档内容，而不只验证 staging 文件。
 if [ "$PATCH_HOUDINI_EXPIRY" = 1 ]; then
-    EXPECT_H32="96fe3acce9aec00bf5d44a187e727aa6d1ef1cf29043c661fa26d4446044e993"
-    EXPECT_H64="847be255d03886974ff0cff09d09b7530301d24671ce0f80172ab3a0629d23b8"
+    EXPECT_H32=$PATCHED_H32; EXPECT_H64=$PATCHED_H64
 else
-    EXPECT_H32="f8df8ff7e4894feec7876135f88cb9b9f3e3c9a4221c909c9b45c35bc02f9866"
-    EXPECT_H64="b321439df5a64ff29a62bb168303e58f800e94113c399f52795c42793f7f5f1e"
+    EXPECT_H32=$ORIG_H32; EXPECT_H64=$ORIG_H64
 fi
 for spec in "system/lib/libhoudini.so:$EXPECT_H32" \
             "system/lib64/libhoudini.so:$EXPECT_H64"; do
@@ -263,7 +282,20 @@ install -Dm755 "$ASSETS/chromeos/kernel.keyblock" "$MGDIR/chromeos/kernel.keyblo
 install -Dm755 "$ASSETS/chromeos/kernel_data_key.vbprivk" "$MGDIR/chromeos/kernel_data_key.vbprivk"
 install -Dm755 "$ASSETS/addon.d.sh"       "$MGDIR/addon.d.sh"
 install -Dm755 "$ASSETS/boot_patch.sh"    "$MGDIR/boot_patch.sh"
-install -Dm755 "$ASSETS/stub.apk"         "$MGDIR/stub.apk"
+# Kitsune 的 stub 壳会去 1q23lyc45.github.io 取 canary.json 下载完整版, 该地址已 404,
+# 壳点开即 System.exit(0)。magiskd 只在 MAGISKTMP 里有 stub.apk 时才会装壳
+# (package.cpp install_stub: stub_apk_fd < 0 直接返回), --setup-sbin 也是"有才拷"。
+# 所以 Kitsune 不放 stub.apk, 从源头上不让 magiskd 装壳; 签名比对以 stub 证书为基准,
+# 缺省时 default_cert 为空, 不会误删完整版。"隐藏 Magisk 应用"用的是 APK 自带的
+# assets/stub.apk, 不受影响。
+# 官方 Magisk(v30.7) 的签名检查在非 debug 构建下会因基准证书为空而卸载 app,
+# 无法确认预编译 APK 的构建类型, 故保留 stub.apk, 由 install_app.sh 监视覆盖。
+if [ "$ROOT" = kitsune ]; then
+    WATCH_STUB=0
+else
+    install -Dm755 "$ASSETS/stub.apk"     "$MGDIR/stub.apk"
+    WATCH_STUB=1
+fi
 install -Dm755 "$ASSETS/util_functions.sh" "$MGDIR/util_functions.sh"
 install -Dm755 "$DL/$MAGISK_APK"          "$MGDIR/magisk.apk"
 # Kitsune 多出的资源, 存在则一并带上
@@ -271,37 +303,30 @@ for f in main.jar module_installer.sh uninstaller.sh bootctl; do
     [ -f "$ASSETS/$f" ] && install -Dm755 "$ASSETS/$f" "$MGDIR/$f"
 done
 
-# magiskd 在 --boot-complete 时, 如果发现 app 未安装,
-# 会自己拿 stub.apk 装一个 41KB 的壳(versionName=1.0)。
-# 那个壳启动后要联网下载完整版, 而 Kitsune 上游地址已 404,
-# 于是 System.exit(0) 自杀 —— 表现为“点开就闪退”。
-# 所以这里不能只判断“未安装才装”, 还要把已经装上的壳覆盖掉。
-# 注意时序: magiskd 在它自己的时机 pm_install /data/stub.apk,
-# 可能发生在本脚本之后 —— 只跑一次会被它覆盖回去。
-# 所以后台持续监视一段时间, 发现壳就盖回来。
-{
-    echo '#!/system/bin/sh'
-    echo '# 确保装的是完整版 Magisk app 而不是 stub 壳'
-    echo '#'
-    echo '# magiskd 在 --boot-complete 后会自己 pm_install /data/stub.apk,'
-    echo '# 时机不确定(可能在本脚本之后), 壳启动后要联网下载完整版而上游 404,'
-    echo '# 于是 System.exit(0) —— 表现为“点开就闪退”。'
-    echo '# 故持续监视而非只检查一次。'
-    echo 'APK=/system/etc/init/magisk/magisk.apk'
-    echo "PKG=$MAGISK_PKG"
-    echo ''
-    echo 'i=0'
-    echo 'while [ $i -lt 60 ]; do'
-    echo '    ver=$(dumpsys package $PKG 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
-    echo '    case "$ver" in'
-    echo '        ""|1.0)'
-    echo '            # 未安装或是 stub 壳 -> 装/覆盖完整版'
-    echo '            pm install -r -d "$APK" >/dev/null 2>&1'
-    echo '            ;;'
-    echo '    esac'
-    echo '    i=$((i+1)); sleep 2'
-    echo 'done'
-} > "$MGDIR/install_app.sh"
+# 开机后安装完整版 Magisk app (versionName 为空=未安装, 1.0=stub 壳)。
+# WATCH_STUB=1 时 magiskd 仍可能在 --boot-complete 之后自己 pm_install stub,
+# 时机不定, 只检查一次会被盖回去, 所以持续监视两分钟。
+cat > "$MGDIR/install_app.sh" <<EOF
+#!/system/bin/sh
+APK=/system/etc/init/magisk/magisk.apk
+PKG=$MAGISK_PKG
+WATCH_STUB=$WATCH_STUB
+
+i=0
+while [ \$i -lt 60 ]; do
+    ver=\$(dumpsys package \$PKG 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)
+    case "\$ver" in
+        ""|1.0)
+            pm install -r -d "\$APK" >/dev/null 2>&1
+            ;;
+        *)
+            # 镜像不带 stub.apk 时 magiskd 不会再装壳, 装好即可退出
+            [ "\$WATCH_STUB" = 1 ] || exit 0
+            ;;
+    esac
+    i=\$((i+1)); sleep 2
+done
+EOF
 chmod 0755 "$MGDIR/install_app.sh"
 
 

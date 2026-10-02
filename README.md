@@ -125,7 +125,8 @@ adb -s $D logcat -d -s gpu_config                # 开机时选了哪个节点�
 # 以下仅 houdini-magisk 镜像：
 adb -s $D shell getprop ro.dalvik.vm.native.bridge  # libhoudini.so
 adb -s $D shell sha256sum /system/lib{,64}/libhoudini.so
-# 默认应分别为 96fe3acc...（32 位）和 847be255...（64 位）
+# 默认 (com1.3) 应分别为 fa74f6f7...（32 位）和 da7448b3...（64 位）
+# HOUDINI_VERSION=1.2 构建的为 96fe3acc... 和 847be255...
 adb -s $D shell grep -c arm64 /linkerconfig/ld.config.txt  # >0
 adb -s $D shell "echo id | /sbin/su"            # uid=0(root)
 adb -s $D shell dumpsys package io.github.huskydg.magisk | grep versionName  # 非 1.0
@@ -222,15 +223,20 @@ scripts/patch-gbm-mesa-skip-map-stride.py
 
 ## Kitsune 的 PID 修复是否必要
 
-问题是真实的：Kitsune `ea3f64a` 的 `ptrace.cpp` 用固定
-`bitset<32768>` 按 PID 下标访问；现代 Linux 的 `kernel.pid_max` 通常是
-4194304，长时间运行后 PID 超过 32768 会越界。先前版本中的补丁还是损坏的
+问题是真实的，**而且上游没有修**：Kitsune `ea3f64a` 的 `ptrace.cpp` 用固定
+`bitset<32768>` 按 PID 下标访问（`std::bitset::operator[]` 不做越界检查），PID 超过
+32768 就会写坏相邻内存。截至 2026-10，ayasa520 fork 的 `kitsune`/`patch-1` 分支和原作者
+1q23lyc45 仓库的最后一个提交（`8e854f3`，"Last Commit"）都还是 `bitset<32768>`。
+
+在 redroid 里尤其容易触发：原版 `redroid.common.rc` 自己就会
+`write /proc/sys/kernel/pid_max 65535`，长时间运行后 PID 超过 32768 是常态。
+只有开启 MagiskHide（默认关闭，开启后且 Zygisk 关闭时才启动 ptrace 监视）才会走到这段代码。先前版本中的补丁还是损坏的
 unified diff；现已在 `ea3f64a97757506707136ff88b0ec730574cae42` 上重新生成，并改用
 按已见最高 PID 动态增长的 packed bitmap：查询 O(1)，没有 32768 硬上限，也没有
 每个 PID 的树/哈希节点分配；即使增长到 Linux 当前 4194304 上限，每组也约 512 KiB。
 
 **注意：默认下载的预编译 Kitsune APK 不含这项源码补丁。** 普通短期实例未必触发；
-长期挂机且容器内 PID 会超过 32768 时，建议从上述 commit 自编译：
+开启 MagiskHide 并长期挂机时，建议从上述 commit 自编译：
 
 ```bash
 git checkout ea3f64a97757506707136ff88b0ec730574cae42
@@ -240,7 +246,7 @@ git apply /path/to/redroid-graft/patches/kitsune-pid-set-dynamic.patch
 MAGISK_LOCAL_APK=/path/to/app-debug.apk ./scripts/build.sh
 ```
 
-若容器内 `cat /proc/sys/kernel/pid_max` 不大于 32768，则不需要这项补丁。
+不开 MagiskHide，或容器内 `cat /proc/sys/kernel/pid_max` 不大于 32768 时，不需要这项补丁。
 不建议为了规避它而降低宿主全局 `kernel.pid_max`。
 
 ## 文档
@@ -270,6 +276,7 @@ MAGISK_LOCAL_APK=/path/to/app-debug.apk ./scripts/build.sh
 ```bash
 ROOT=magisk ./scripts/build.sh        # 用官方 Magisk（产出 redroid13-graft-houdini-magisk-official:latest）
 PATCH_HOUDINI_EXPIRY=0 ./scripts/build.sh  # 诊断：保留原版有效期行为
+HOUDINI_VERSION=1.2 ./scripts/build.sh     # 回退到实机验证过的 HPE 14 com1.2
 CTR=docker ./scripts/gralloc4.sh      # 用 docker 而非 podman
 BUILD_IMAGE=0 ./scripts/gralloc4.sh   # 只生成 tar 层，不构建镜像
 NEW_IMAGE=myrepo/android:13 ./scripts/gralloc4.sh
