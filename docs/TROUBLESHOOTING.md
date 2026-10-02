@@ -315,8 +315,9 @@ adb shell getprop ro.dalvik.vm.native.bridge
 把 houdini 层改好的属性覆盖回了默认值。
 
 **现行修复** — 构建顺序改为先 `gralloc4.sh` 再 `build.sh`：
-图形栈底图先就位；`build.sh` 只 patch native bridge 相关键，
-保留 `ro.hardware.gralloc` / `ro.hardware.egl`。
+图形栈底图先就位；`build.sh` 只 patch native bridge 相关键。
+后来图形栈属性又从 `build.prop` 挪到了开机执行的 `gpu_config.sh`
+（见 ARCHITECTURE「GPU 属性：开机探测」），这一类覆盖已经不会再波及图形栈。
 
 > 多层叠加时，**后层的同名文件会完全覆盖前层**。
 > 凡是要改配置文件的层，模板必须从直接上一层取，不能从原始镜像取；
@@ -454,7 +455,9 @@ Intel-only 硬编码后照样崩；根因是 allocate 时的 `gbm_bo_map` 探测
 2. **crash buffer 为空 ≠ 没问题** — 可能是主动 `System.exit`。
 3. **对比两个进程的日志** — 同一套库在 A 进程能用、B 进程不行,
    差异往往在位数（32/64）、命名空间、或加载方式（passthrough vs binder）。
-4. **`readelf -d` 查依赖闭包** — 搬运二进制时必做，能提前发现缺库。
+4. **按链接器命名空间查依赖闭包** — 搬运二进制时必做。文件"存在"不等于
+   "可见"：sphal/vendor 命名空间看不到大部分 `/system/lib*`。
+   `scripts/check-vendor-closure.py` 在构建时自动做，含符号检查。
 5. **`strings` 定位日志来源** — 判断某条日志来自新库还是旧库，
    是确认"新组件是否真的生效"的可靠手段。
 6. **用最快的命令复现** — `screenrecord` 比开 scrcpy 快，
@@ -462,6 +465,8 @@ Intel-only 硬编码后照样崩；根因是 allocate 时的 `gbm_bo_map` 探测
 7. **游戏是否 Vulkan 看 `dumpsys gpu`，别看 gfxinfo 的 Skia 行**（见 §8）。
 8. **「能进设置」的旧容器未必带 Vulkan** — 先 `getprop ro.hardware.gralloc`
    区分 `gbm`（旧）和 `minigbm_gbm_mesa`（嫁接）。
+9. **Vulkan 驱动选得对不对** — `logcat -d -s gpu_config` 会打印选中的节点、内核驱动
+   和 `ro.hardware.vulkan`；不对就用 `androidboot.redroid_vulkan=` 强制。
 
 ---
 

@@ -1,55 +1,74 @@
 #!/bin/bash
-# 把 Waydroid(LineageOS 20) 的 gralloc4/minigbm 移植进 redroid 13
+# 把 Waydroid 的 gralloc4 (minigbm_gbm_mesa) + Mesa 26 图形栈嫁接进 redroid
+#   ANDROID_VERSION=13 (默认): Waydroid LOS20 vendor → redroid 13
+#   ANDROID_VERSION=15 (实验): Waydroid LOS22 vendor → redroid 15
 #
 # 背景: redroid 只有 graphics.allocator@2.0 + 老式 gbm_gralloc,
 #       Mesa ANV(Vulkan) 需要 gralloc4 才能分配 swapchain buffer,
 #       否则 dequeueBuffer 返回 -22, Vulkan-only 的 Unity 游戏无法运行。
-# 两者同为 Android 13 / x86_64, ABI 兼容, 直接搬运二进制。
+# 两者 Android 版本 / x86_64 ABI 一致, 直接搬运二进制; 依赖与符号由
+# check-vendor-closure.py 按链接器命名空间校验。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DL="$HERE/dl"
-SRC="$HERE/src/gralloc4"
 OUT="$HERE/out"
 CTR=${CTR:-podman}
+ANDROID_VERSION=${ANDROID_VERSION:-13}
 
-WD_VENDOR_URL="https://sourceforge.net/projects/waydroid/files/images/vendor/waydroid_x86_64/lineage-20.0-20260428-MAINLINE-waydroid_x86_64-vendor.zip/download"
-WD_VENDOR_ZIP="$DL/waydroid-vendor.zip"
-WD_VENDOR_SHA="cba35433ffca73ed349e096b1daec495b3204e01c0e541c4203671e6d648e874"
+case "$ANDROID_VERSION" in
+13)
+    WD_VENDOR_URL="${WD_VENDOR_URL:-https://sourceforge.net/projects/waydroid/files/images/vendor/waydroid_x86_64/lineage-20.0-20260428-MAINLINE-waydroid_x86_64-vendor.zip/download}"
+    WD_VENDOR_ZIP="${WD_VENDOR_ZIP:-$DL/waydroid-vendor.zip}"
+    WD_VENDOR_SHA="${WD_VENDOR_SHA:-cba35433ffca73ed349e096b1daec495b3204e01c0e541c4203671e6d648e874}"
+    # graft 只支持 x86_64, 默认锁定该 tag 当前的 amd64 manifest digest
+    DEFAULT_BASE="docker.io/redroid/redroid:13.0.0-latest@sha256:524987f1fc489f6018e2c9d0dd622e5eccea13eb896417cb4bfb26bc3fea9afd"
+    DEFAULT_NEW="localhost/redroid13-graft:latest"
+    # 已审阅过的原版 /vendor/bin/gpu_config.sh, 被 files/gpu_config.sh 替换
+    GPU_CONFIG_SHA="86812ee33d1fa09cde706593586cd56f2196f7a01b026ad67dd4f151bfe32718"
+    # Android 13 的 libdmabufheap 由 VNDK-SP 提供
+    EXTRA_LIBS=""
+    TAG=gralloc4
+    ;;
+15)
+    WD_VENDOR_URL="${WD_VENDOR_URL:-https://github.com/WayDroid-ATV/waydroid-builds/releases/download/20260224/lineage-22.2-20260224-UNOFFICIAL-waydroid_x86_64.zip}"
+    WD_VENDOR_ZIP="${WD_VENDOR_ZIP:-$DL/waydroid-los22-20260224-x86_64.zip}"
+    WD_VENDOR_SHA="${WD_VENDOR_SHA:-6d08847141fe3668704bd5a9acb345cf2a8f295ccbc8e7cfb9c60149ca7b805b}"
+    DEFAULT_BASE="docker.io/redroid/redroid:15.0.0-latest@sha256:25879821f13ffd38d5d6047d832379b96cf72ec520508b45036dca25cdc3737f"
+    DEFAULT_NEW="localhost/redroid15-graft:latest"
+    GPU_CONFIG_SHA="4b38dd8304fa30b20038f3d97e84c28eef1d44312c5dc485f2fc01f76a0e34fa"
+    # Android 15 没有 VNDK: allocator/mapper@4 硬依赖的 libdmabufheap 必须放进 vendor,
+    # /system/lib64 里那份 vendor 命名空间看不到
+    EXTRA_LIBS="libdmabufheap.so"
+    TAG=gralloc4-15
+    ;;
+*)
+    echo "不支持的 ANDROID_VERSION=$ANDROID_VERSION (可选 13 / 15)" >&2; exit 1 ;;
+esac
 
-# 先打图形栈底图; houdini/Magisk 由 build.sh 叠在这之上。
-# graft 只支持 x86_64，默认锁定该 tag 当前的 amd64 manifest digest。
-BASE_IMAGE="${BASE_IMAGE:-docker.io/redroid/redroid:13.0.0-latest@sha256:524987f1fc489f6018e2c9d0dd622e5eccea13eb896417cb4bfb26bc3fea9afd}"
-NEW_IMAGE="${NEW_IMAGE:-localhost/redroid13-graft:latest}"
+BASE_IMAGE="${BASE_IMAGE:-$DEFAULT_BASE}"
+NEW_IMAGE="${NEW_IMAGE:-$DEFAULT_NEW}"
+SRC="$HERE/src/$TAG"
+BASE="$SRC/base"
 
-if [ -z "${VULKAN_HW:-}" ]; then
-    if [ -n "${VK_DRIVERS:-}" ]; then
-        first_driver=${VK_DRIVERS%% *}
-        VULKAN_HW=${first_driver#vulkan.}
-        VULKAN_HW=${VULKAN_HW%.so}
-    else
-        VULKAN_HW=intel
-    fi
-fi
-if [ -z "${VK_DRIVERS:-}" ]; then
-    if [ "$VULKAN_HW" = intel ]; then
-        VK_DRIVERS="vulkan.intel.so vulkan.intel_hasvk.so"
-    else
-        VK_DRIVERS="vulkan.${VULKAN_HW}.so"
-    fi
-fi
-[[ "$VULKAN_HW" =~ ^[A-Za-z0-9_.-]+$ ]] || {
-    echo "VULKAN_HW 含非法字符: $VULKAN_HW" >&2; exit 1; }
+# Vulkan 驱动: 默认带上 vendor 里所有 x86 PC 可用的 Mesa 26 驱动,
+# 开机时由 gpu_config.sh 按内核驱动 (i915/xe/amdgpu/nouveau/virtio_gpu) 选择。
+# 显式设置 VK_DRIVERS 时其中每一项都必须存在。
+VK_CANDIDATES="vulkan.intel.so vulkan.intel_hasvk.so vulkan.radeon.so vulkan.nouveau.so vulkan.virtio.so"
+VK_DRIVERS_EXPLICIT=${VK_DRIVERS:+1}
+VK_DRIVERS=${VK_DRIVERS:-$VK_CANDIDATES}
 for driver in $VK_DRIVERS; do
     [[ "$driver" =~ ^vulkan\.[A-Za-z0-9_.-]+\.so$ ]] || {
         echo "VK_DRIVERS 中的文件名非法: $driver" >&2; exit 1; }
 done
-case " $VK_DRIVERS " in
-    *" vulkan.${VULKAN_HW}.so "*) ;;
-    *) echo "VK_DRIVERS 不含 VULKAN_HW 对应的 vulkan.${VULKAN_HW}.so" >&2; exit 1 ;;
-esac
 
 msg() { echo -e "\033[1;32m==>\033[0m $*"; }
+warn() { echo -e "\033[1;33m==>\033[0m $*" >&2; }
+
+if [ -n "${VULKAN_HW:-}" ]; then
+    warn "VULKAN_HW 已废弃并被忽略: Vulkan 驱动改为开机时按 GPU 自动选择;" \
+         "需要强制指定时在启动参数里加 androidboot.redroid_vulkan=$VULKAN_HW"
+fi
 
 fetch() { # url sha256 dest
     local url=$1 sha=$2 dest=$3 tmp="${3}.part"
@@ -65,20 +84,23 @@ fetch() { # url sha256 dest
     mv -f "$tmp" "$dest"
 }
 
-copy_from_base() { # path-in-image dest
-    local src=$1 dest=$2 cid
-    cid=$($CTR create "$BASE_IMAGE")
-    if ! $CTR cp "$cid:$src" "$dest"; then
-        $CTR rm -f "$cid" >/dev/null 2>&1 || true
-        return 1
-    fi
-    $CTR rm "$cid" >/dev/null
-}
-
-export_base_filelist() { # dest
+# 只解出校验和改写要用的部分 (约 1 GB), 不落整个 rootfs
+extract_base() { # dest
     local dest=$1 cid
     cid=$($CTR create "$BASE_IMAGE")
-    if ! $CTR export "$cid" 2>/dev/null | tar tf - > "$dest" 2>/dev/null; then
+    if ! $CTR export "$cid" | python3 -c '
+import sys, tarfile
+dest = sys.argv[1]
+want = ("system/lib/", "system/lib64/", "system/apex/", "system/etc/llndk.libraries.txt",
+        "vendor/lib/", "vendor/lib64/", "odm/lib/", "odm/lib64/",
+        "vendor/build.prop", "vendor/bin/gpu_config.sh", "vendor/etc/init/",
+        "vendor/etc/vintf/manifest.xml")
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as t:
+    t.extraction_filter = getattr(tarfile, "tar_filter", None)
+    for m in t:
+        if m.name.lstrip("./").startswith(want):
+            t.extract(m, dest)
+' "$dest"; then
         $CTR rm -f "$cid" >/dev/null 2>&1 || true
         return 1
     fi
@@ -86,95 +108,80 @@ export_base_filelist() { # dest
 }
 
 mkdir -p "$DL" "$OUT"
-rm -f "$OUT/gralloc4.tar" "$OUT/Dockerfile.gralloc4"
-rm -rf "$SRC"; mkdir -p "$SRC/vendor/lib64/hw" "$SRC/vendor/bin/hw" \
-                        "$SRC/vendor/etc/init" "$SRC/vendor/etc/vintf/manifest"
+rm -f "$OUT/$TAG.tar" "$OUT/Dockerfile.$TAG"
+rm -rf "$SRC"; mkdir -p "$SRC" "$BASE"
 
 fetch "$WD_VENDOR_URL" "$WD_VENDOR_SHA" "$WD_VENDOR_ZIP"
 
 msg "解包 vendor.img"
 VIMG="$SRC/vendor.img"
-unzip -oq "$WD_VENDOR_ZIP" -d "$SRC"
+unzip -oq "$WD_VENDOR_ZIP" vendor.img -d "$SRC"
 
-# debugfs 免 root 读取 ext 镜像
-ex() { # src-in-img  dest
-    debugfs -R "dump /$1 $2" "$VIMG" 2>/dev/null
+# LOS20 是 ext2 (debugfs 免 root 读取), LOS22 是 squashfs (7z)
+if [ "$(head -c 4 "$VIMG" | tr -d '\000')" = hsqs ]; then
+    command -v 7z >/dev/null || { echo "squashfs vendor.img 需要 7z (p7zip)" >&2; exit 1; }
+    has() { 7z l -slt "$VIMG" "$1" 2>/dev/null | grep -qx "Path = $1"; }
+    dump() { 7z e -so "$VIMG" "$1" > "$2" 2>/dev/null; }
+else
+    has() { debugfs -R "stat /$1" "$VIMG" 2>/dev/null | grep -q '^Inode:'; }
+    dump() { debugfs -R "dump /$1 $2" "$VIMG" 2>/dev/null; }
+fi
+ex() { # path-in-img  dest
+    mkdir -p "$(dirname "$2")"
+    dump "$1" "$2" || true
     [ -s "$2" ] || { echo "提取失败: $1" >&2; exit 1; }
 }
 
-msg "提取 gralloc4 组件"
+if [ -z "$VK_DRIVERS_EXPLICIT" ]; then
+    found=""
+    for d in $VK_DRIVERS; do
+        has "lib64/hw/$d" && found="$found $d"
+    done
+    VK_DRIVERS=${found# }
+    [ -n "$VK_DRIVERS" ] || { echo "vendor.img 里没有任何可用的 Vulkan 驱动" >&2; exit 1; }
+fi
+msg "Vulkan 驱动: $VK_DRIVERS"
+
+# 着色器编译器 libLLVM 的版本随 Waydroid 构建变化 (LOS20: 22, LOS22: 21), 从 DT_NEEDED 读
+ex lib64/libgallium_dri.so "$SRC/probe/libgallium_dri.so"
+LLVM_LIB=$(readelf -d "$SRC/probe/libgallium_dri.so" | grep -oE 'libLLVM[0-9.]*\.so' | head -n 1)
+[ -n "$LLVM_LIB" ] || { echo "libgallium_dri.so 未链接 libLLVM*, 无法确定版本" >&2; exit 1; }
+rm -rf "$SRC/probe"
+
+########################################
+# 提取组件 (64 位 + 32 位)
+#
+# gralloc4 HAL:   allocator@4.0 服务 + mapper@4.0 passthrough + minigbm
+# Mesa 26:        dri_gbm(gbm 后端) → libgallium_dri(megadriver) → libLLVM(着色器编译器)
+#                 libdrm 等 Mesa 链的是无版本后缀的名字, 与 redroid 的 libdrm.so.2 共存
+# EGL/GLES:       必须一起换成 Mesa 26; redroid 的 Mesa 24 EGL 走 gralloc0 接口,
+#                 与 gralloc4 handle 不兼容, SurfaceFlinger 会在 gbm_mesa_bo_import 崩
+# Vulkan HAL:     必须是 Mesa 26; Mesa 24 的驱动不认识 gralloc4 buffer,
+#                 "vkCreateImage w/ native buffer failed"
+# 32 位:          mapper 是 passthrough (进程内加载), 32 位进程 (如 OMX 编码服务)
+#                 需要 32 位实现, 否则 screenrecord/scrcpy 灰屏
+########################################
+msg "提取 gralloc4 + Mesa 26 组件 ($LLVM_LIB)"
 ex bin/hw/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa \
    "$SRC/vendor/bin/hw/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa"
-for l in android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so \
-         gralloc.minigbm_gbm_mesa.so; do
-    ex "lib64/hw/$l" "$SRC/vendor/lib64/hw/$l"
-done
-# minigbm 及其 gbm 后端 + libdrm (redroid 没有)
-for l in libminigbm_gralloc_gbm_mesa.so libgbm_mesa.so libgbm_mesa_wrapper.so libdrm.so; do
-    ex "lib64/$l" "$SRC/vendor/lib64/$l"
-done
-
-# Mesa 26 的 gbm 后端.
-# redroid 自带 Mesa 24.0.8, 对 Arc(xe 内核驱动) 支持不完整,
-# minigbm 会报 "Found GPU xe" 后 "Unable to create gbm_mesa driver".
-# libgbm_mesa.so 通过 MESA-LOADER 在 /vendor/lib64 找 dri_gbm.so,
-# dri_gbm.so 再链到 libgallium_dri.so(megadriver, 含 xe 支持)
-# 注意: redroid 自带的是 libdrm.so.2 / libdrm_intel.so.1 这种带版本后缀的名字,
-# Mesa 26 链的是无后缀的 libdrm.so / libdrm_intel.so, 两套可共存不冲突.
-# libLLVM22.so 是 gallium 的着色器编译器, 缺失会导致 gbm_create_device 失败
-for l in dri_gbm.so libgallium_dri.so libLLVM22.so \
-         libdrm_intel.so libdrm_amdgpu.so libdrm_radeon.so; do
-    ex "lib64/$l" "$SRC/vendor/lib64/$l"
+for B in lib64 lib; do
+    for l in android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so \
+             gralloc.minigbm_gbm_mesa.so $VK_DRIVERS; do
+        ex "$B/hw/$l" "$SRC/vendor/$B/hw/$l"
+    done
+    # shellcheck disable=SC2086
+    for l in libminigbm_gralloc_gbm_mesa.so libgbm_mesa.so libgbm_mesa_wrapper.so \
+             libdrm.so libdrm_intel.so libdrm_amdgpu.so libdrm_radeon.so \
+             dri_gbm.so libgallium_dri.so "$LLVM_LIB" $EXTRA_LIBS; do
+        ex "$B/$l" "$SRC/vendor/$B/$l"
+    done
+    for l in libEGL_mesa.so libGLESv1_CM_mesa.so libGLESv2_mesa.so; do
+        ex "$B/egl/$l" "$SRC/vendor/$B/egl/$l"
+    done
 done
 
-# EGL/GLES 也必须一起换成 Mesa 26:
-# redroid 自带的 libEGL_mesa.so(Mesa 24) 走的是 gralloc0 接口(日志 "Using gralloc0 CrOS API"),
-# 与 gralloc4 分配的 buffer handle 结构对不上,
-# 导致 SurfaceFlinger 在 gbm_mesa_bo_import 里空指针 SIGSEGV。
-# Mesa 26 的 EGL 直接链 mapper@4.0 + libgralloctypes, 原生支持 gralloc4。
-mkdir -p "$SRC/vendor/lib64/egl"
-for l in libEGL_mesa.so libGLESv1_CM_mesa.so libGLESv2_mesa.so; do
-    ex "lib64/egl/$l" "$SRC/vendor/lib64/egl/$l"
-done
-
-# Vulkan HAL 也必须是 Mesa 26 的 ANV:
-# redroid 自带 Mesa 24 的 vulkan.intel.so 不认识 gralloc4 分配的 buffer,
-# 导致 "vkCreateImage w/ native buffer failed" → GetSwapchainImagesKHR 空指针崩溃。
-# 只带 intel(Arc/核显)。曾打包全厂商驱动 + detect_gpu 自动选；
-# Settings 崩后来证实与此无关（见 TROUBLESHOOTING §7 的 map_stride 补丁），
-# 现保持 Intel-only 以减小面。
-for l in $VK_DRIVERS; do
-    ex "lib64/hw/$l" "$SRC/vendor/lib64/hw/$l"
-done
-
-########################################
-# 32 位一整套
-# mapper 是 passthrough(进程内加载), 32 位进程需要 32 位实现。
-# redroid 的 android.hardware.media.omx@1.0-service 是 32 位,
-# 缺失时会 abort: "gralloc-mapper is missing",
-# 导致 screenrecord/scrcpy 编码器拿不到 buffer(灰屏)。
-########################################
-msg "提取 32 位组件"
-mkdir -p "$SRC/vendor/lib/hw" "$SRC/vendor/lib/egl"
-for l in android.hardware.graphics.mapper@4.0-impl.minigbm_gbm_mesa.so \
-         gralloc.minigbm_gbm_mesa.so; do
-    ex "lib/hw/$l" "$SRC/vendor/lib/hw/$l"
-done
-for l in libminigbm_gralloc_gbm_mesa.so libgbm_mesa.so libgbm_mesa_wrapper.so \
-         libdrm.so dri_gbm.so libgallium_dri.so libLLVM22.so \
-         libdrm_intel.so libdrm_amdgpu.so libdrm_radeon.so; do
-    ex "lib/$l" "$SRC/vendor/lib/$l"
-done
-for l in libEGL_mesa.so libGLESv1_CM_mesa.so libGLESv2_mesa.so; do
-    ex "lib/egl/$l" "$SRC/vendor/lib/egl/$l"
-done
-for l in $VK_DRIVERS; do
-    ex "lib/hw/$l" "$SRC/vendor/lib/hw/$l"
-done
-
-chmod 0755 "$SRC/vendor/bin/hw/"* 
-chmod 0644 "$SRC/vendor/lib64/"*.so "$SRC/vendor/lib64/hw/"*.so "$SRC/vendor/lib64/egl/"*.so \
-           "$SRC/vendor/lib/"*.so "$SRC/vendor/lib/hw/"*.so "$SRC/vendor/lib/egl/"*.so
+chmod 0755 "$SRC/vendor/bin/hw/"*
+find "$SRC/vendor/lib" "$SRC/vendor/lib64" -name '*.so' -exec chmod 0644 {} +
 
 ########################################
 # Arc/xe: 跳过 allocate 时的 gbm_bo_map 探测 map_stride
@@ -184,12 +191,16 @@ chmod 0644 "$SRC/vendor/lib64/"*.so "$SRC/vendor/lib64/hw/"*.so "$SRC/vendor/lib
 msg "打补丁: 跳过 gbm_mesa_alloc 的 map_stride 探测 (xe)"
 python3 "$HERE/patch-gbm-mesa-skip-map-stride.py" \
     "$SRC/vendor/lib64/libgbm_mesa_wrapper.so"
-# 32 位若签名不同则跳过 (allocator@4 是 64 位服务)
-if [ -f "$SRC/vendor/lib/libgbm_mesa_wrapper.so" ]; then
-    python3 "$HERE/patch-gbm-mesa-skip-map-stride.py" \
-        "$SRC/vendor/lib/libgbm_mesa_wrapper.so" || \
-        msg "32 位 wrapper 签名不匹配, 跳过 (allocator 为 64 位)"
-fi
+# allocator@4 是 64 位服务, 32 位 wrapper 不会走 allocate; 签名未知时跳过
+python3 "$HERE/patch-gbm-mesa-skip-map-stride.py" \
+    "$SRC/vendor/lib/libgbm_mesa_wrapper.so" || \
+    msg "32 位 wrapper 签名不匹配, 跳过 (allocator 为 64 位)"
+
+########################################
+# 基础镜像: 后面的改写和依赖校验都基于它
+########################################
+msg "从基础镜像提取库与配置"
+extract_base "$BASE"
 
 ########################################
 # VINTF: 声明 allocator@4.0 / mapper@4.0
@@ -197,6 +208,7 @@ fi
 # 不需要 Waydroid 那套 manifest.disabled + bind mount
 ########################################
 msg "生成 VINTF manifest"
+mkdir -p "$SRC/vendor/etc/vintf/manifest"
 cat > "$SRC/vendor/etc/vintf/manifest/gbm_mesa.allocator@4.0.xml" <<'EOF'
 <manifest version="1.0" type="device">
     <hal format="hidl">
@@ -223,12 +235,27 @@ cat > "$SRC/vendor/etc/vintf/manifest/gbm_mesa.mapper@4.0.xml" <<'EOF'
     </hal>
 </manifest>
 EOF
-chmod 0644 "$SRC/vendor/etc/vintf/manifest/"*.xml
+
+# 主 manifest: 移除 allocator@2.0 / mapper@2.1 声明, 由上面的文件提供 4.0
+python3 - "$BASE/vendor/etc/vintf/manifest.xml" "$SRC/vendor/etc/vintf/manifest.xml" <<'PYEOF'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+x = open(src).read()
+pat = re.compile(
+    r'[ \t]*<hal format="hidl">\s*<name>android\.hardware\.graphics\.'
+    r'(?:allocator|mapper)</name>.*?</hal>\n', re.S)
+x2, n = pat.subn('', x)
+assert n == 2, f"预期删除 2 个 hal 块, 实际 {n}"
+open(dst, 'w').write(x2)
+print(f"已移除 {n} 个旧 graphics HAL 声明")
+PYEOF
+chmod 0644 "$SRC/vendor/etc/vintf/manifest.xml" "$SRC/vendor/etc/vintf/manifest/"*.xml
 
 ########################################
 # init: 启动 allocator@4.0, 停用 2.0
 ########################################
 msg "生成 init rc"
+mkdir -p "$SRC/vendor/etc/init"
 cat > "$SRC/vendor/etc/init/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa.rc" <<'EOF'
 service vendor.graphics.allocator-4-0 /vendor/bin/hw/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa
     interface android.hardware.graphics.allocator@4.0::IAllocator default
@@ -238,9 +265,6 @@ service vendor.graphics.allocator-4-0 /vendor/bin/hw/android.hardware.graphics.a
     capabilities SYS_NICE
     onrestart restart surfaceflinger
     task_profiles ServiceCapacityLow
-
-on early-init
-    stop vendor.gralloc-2-0
 EOF
 
 # 覆盖原 2.0 服务定义, 加 disabled 使其不自动启动
@@ -257,105 +281,56 @@ EOF
 chmod 0644 "$SRC/vendor/etc/init/"*.rc
 
 ########################################
-# 主 manifest: 移除 allocator@2.0 / mapper@2.1 声明
+# GPU 属性: 替换 redroid 的 gpu_config.sh, 开机时按实际 GPU 设置
+#   ro.hardware.gralloc=minigbm_gbm_mesa / ro.hardware.egl=mesa / ro.hardware.vulkan=<探测>
+# 不再写进 vendor/build.prop: ro.* 先写者胜, 写死会让 gpu_config.sh 的探测静默失效,
+# 一个镜像也就只能对应一个厂商。
 ########################################
-msg "改写 vendor manifest.xml"
-copy_from_base /vendor/etc/vintf/manifest.xml "$SRC/manifest.xml.orig"
-
-python3 - "$SRC/manifest.xml.orig" "$SRC/vendor/etc/vintf/manifest.xml" <<'PYEOF'
-import re, sys
-src, dst = sys.argv[1], sys.argv[2]
-x = open(src).read()
-# 删掉 graphics.allocator 和 graphics.mapper 的 <hal> 块, 由新 manifest 文件提供 4.0 版本
-pat = re.compile(
-    r'[ \t]*<hal format="hidl">\s*<name>android\.hardware\.graphics\.'
-    r'(?:allocator|mapper)</name>.*?</hal>\n', re.S)
-x2, n = pat.subn('', x)
-assert n == 2, f"预期删除 2 个 hal 块, 实际 {n}"
-open(dst, 'w').write(x2)
-print(f"已移除 {n} 个旧 graphics HAL 声明")
-PYEOF
-chmod 0644 "$SRC/vendor/etc/vintf/manifest.xml"
-
-########################################
-# 属性
-########################################
-msg "生成属性覆盖"
-mkdir -p "$SRC/props"
-copy_from_base /vendor/build.prop "$SRC/props/build.prop"
-
-python3 - "$SRC/props/build.prop" "$VULKAN_HW" <<'PYEOF'
-import re, sys
-p, vulkan_hw = sys.argv[1:]
-props = {
-    "ro.hardware.gralloc": "minigbm_gbm_mesa",
-    "ro.hardware.vulkan": vulkan_hw,
-    "ro.hardware.egl": "mesa",
-}
-lines = open(p).read().splitlines()
-seen = set()
-out = []
-for ln in lines:
-    m = re.match(r"^([\w.]+)=", ln)
-    if m and m.group(1) in props:
-        k = m.group(1); out.append(f"{k}={props[k]}"); seen.add(k)
-    else:
-        out.append(ln)
-rest = [k for k in props if k not in seen]
-if rest:
-    out.append("# gralloc4 / vulkan")
-    out += [f"{k}={props[k]}" for k in rest]
-open(p, "w").write("\n".join(out) + "\n")
-print("patched vendor/build.prop:", ", ".join(props))
-PYEOF
-
-mkdir -p "$SRC/layer/vendor"
-cp -a "$SRC/vendor/." "$SRC/layer/vendor/"
-cp "$SRC/props/build.prop" "$SRC/layer/vendor/build.prop"
-chmod 0644 "$SRC/layer/vendor/build.prop"
-
-tar --owner=0 --group=0 --numeric-owner -cf "$OUT/gralloc4.tar" -C "$SRC/layer" vendor
-msg "gralloc4.tar 就绪"
+msg "替换 gpu_config.sh (开机按 GPU 选 Vulkan 驱动)"
+got=$(sha256sum "$BASE/vendor/bin/gpu_config.sh" | cut -d' ' -f1)
+[ "$got" = "$GPU_CONFIG_SHA" ] || {
+    echo "基础镜像的 gpu_config.sh 与已审阅版本不同 (sha256 $got)。" >&2
+    echo "请对照 scripts/files/gpu_config.sh 合并上游改动, 再更新本脚本里的 GPU_CONFIG_SHA。" >&2
+    exit 1; }
+grep -q '^ *exec -- /vendor/bin/gpu_config.sh' "$BASE/vendor/etc/init/redroid.common.rc" || {
+    echo "基础镜像的 redroid.common.rc 不再执行 gpu_config.sh, 需要重新审阅" >&2; exit 1; }
+if grep -qE '^ro\.hardware\.(gralloc|egl|vulkan)=' "$BASE/vendor/build.prop"; then
+    echo "基础镜像 vendor/build.prop 写死了 ro.hardware.{gralloc,egl,vulkan}," >&2
+    echo "会让 gpu_config.sh 的设置失效。请以原版 redroid 为底图 (不要叠在旧的 graft 镜像上)。" >&2
+    exit 1
+fi
+vk_names=$(for d in $VK_DRIVERS; do d=${d#vulkan.}; printf '%s ' "${d%.so}"; done)
+vk_names=${vk_names% }
+mkdir -p "$SRC/vendor/bin"
+sed "s/@GRAFT_VK_DRIVERS@/$vk_names/" "$HERE/files/gpu_config.sh" > "$SRC/vendor/bin/gpu_config.sh"
+! grep -q '@GRAFT_' "$SRC/vendor/bin/gpu_config.sh" || { echo "gpu_config.sh 模板未替换完整" >&2; exit 1; }
+chmod 0755 "$SRC/vendor/bin/gpu_config.sh"
 
 ########################################
-# 依赖闭包校验
-# 遍历新增的每个 .so, 确认其 DT_NEEDED 要么在本层、要么基础镜像已有。
-# 这个检查抳到过 libLLVM22.so 的缺失(表现为 Unable to create gbm device)
+# 打包 + 依赖闭包/符号校验
+# 按 vendor/sphal 链接器命名空间解析每个新增 ELF 的 DT_NEEDED, 并检查未定义符号。
+# 抓到过 libLLVM 缺失 (Unable to create gbm device)、Android 15 的 libdmabufheap
+# 只在 /system 下 (vendor 命名空间不可见)。
 ########################################
-msg "校验依赖闭包"
-BASE_LIST="$SRC/base.filelist"
-export_base_filelist "$BASE_LIST"
+mkdir -p "$SRC/layer"
+cp -a "$SRC/vendor" "$SRC/layer/"
 
-MISSING=0
-for B in lib lib64; do
-    d="$SRC/vendor/$B"
-    [ -d "$d" ] || continue
-    deps=$(cd "$d" && for f in *.so egl/*.so hw/*.so; do
-        [ -f "$f" ] && readelf -d "$f" 2>/dev/null | grep NEEDED |
-            grep -oE '\[[^]]+\]' | tr -d '[]'
-    done | sort -u)
-    for L in $deps; do
-        [ -f "$d/$L" ] || [ -f "$d/hw/$L" ] || [ -f "$d/egl/$L" ] && continue
-        esc=$(printf '%s' "$L" | sed 's/[.[\*^$]/\\&/g')
-        grep -qE "(system|vendor)/$B/(hw/|egl/)?$esc\$" "$BASE_LIST" || {
-            echo "  !! $B 缺失依赖: $L" >&2; MISSING=1; }
-    done
-done
-[ "$MISSING" = 0 ] && msg "依赖闭包 OK" || { echo "存在未满足的依赖, 终止" >&2; exit 1; }
+msg "校验依赖闭包与符号 (链接器命名空间)"
+python3 "$HERE/check-vendor-closure.py" "$BASE" "$SRC/layer"
 
-########################################
-# 构建镜像
-########################################
-cat > "$OUT/Dockerfile.gralloc4" <<EOF
+tar --owner=0 --group=0 --numeric-owner -cf "$OUT/$TAG.tar" -C "$SRC/layer" vendor
+msg "$TAG.tar 就绪"
+
+cat > "$OUT/Dockerfile.$TAG" <<EOF
 FROM $BASE_IMAGE
 
-ADD gralloc4.tar /
+ADD $TAG.tar /
 EOF
 
 if [ "${BUILD_IMAGE:-1}" = 1 ]; then
     msg "构建镜像 $NEW_IMAGE"
-    $CTR build -t "$NEW_IMAGE" -f "$OUT/Dockerfile.gralloc4" "$OUT"
+    $CTR build -t "$NEW_IMAGE" -f "$OUT/Dockerfile.$TAG" "$OUT"
     msg "完成: $NEW_IMAGE"
 else
-    msg "已生成 $OUT/Dockerfile.gralloc4, 自行构建"
+    msg "已生成 $OUT/Dockerfile.$TAG, 自行构建"
 fi

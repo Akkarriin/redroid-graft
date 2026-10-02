@@ -10,7 +10,7 @@ SRC="$HERE/src"
 OUT="$HERE/out"
 CTR=${CTR:-podman}
 
-# 基底必须是已嫁接 gralloc4 的镜像, 否则 props 层会盖掉图形栈属性
+# 基底必须是已嫁接 gralloc4 的镜像 (gralloc4.sh 的产物)
 BASE_IMAGE="${BASE_IMAGE:-localhost/redroid13-graft:latest}"
 
 # ROOT=kitsune  -> Kitsune Magisk (Delta 后继, 内置 MagiskHide, 隐藏效果好)
@@ -353,9 +353,11 @@ PR="$SRC/props"
 mkdir -p "$PR/vendor" "$PR/system"
 copy_from_base /vendor/build.prop "$PR/vendor/build.prop"
 copy_from_base /system/build.prop "$PR/system/build.prop"
-if ! grep -qx 'ro.hardware.gralloc=minigbm_gbm_mesa' "$PR/vendor/build.prop" ||
-   ! grep -qx 'ro.hardware.egl=mesa' "$PR/vendor/build.prop"; then
-    echo "错误: BASE_IMAGE 不是已嫁接 gralloc4/Mesa 的底图: $BASE_IMAGE" >&2
+# 图形栈属性由嫁接版 gpu_config.sh 开机设置, 不在 build.prop 里; 以它为嫁接标记
+copy_from_base /vendor/bin/gpu_config.sh "$SRC/gpu_config.sh.base"
+if ! grep -q '^# redroid-graft:' "$SRC/gpu_config.sh.base"; then
+    echo "错误: BASE_IMAGE 不是当前版本 gralloc4.sh 产出的底图: $BASE_IMAGE" >&2
+    echo "      (旧版底图把 ro.hardware.* 写死在 build.prop 里, 请重新运行 ./scripts/gralloc4.sh)" >&2
     exit 1
 fi
 

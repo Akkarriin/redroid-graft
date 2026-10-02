@@ -47,8 +47,8 @@ Waydroid 本身就有完整的 gralloc4 + Vulkan，桌面上跑游戏没问题�
 ## 快速开始
 
 依赖：`podman` 或 `docker`、`curl`、`unzip`、`e2fsprogs`（`debugfs`）、
-`python3`、`binutils`（`readelf`，做依赖闭包校验）。LiteGapps 另需带 xz
-支持的 `tar`；Android 15 实验脚本还需 `p7zip`（`7z`）和 `file`。
+`python3`、`binutils`（`readelf`，做依赖闭包与符号校验）。LiteGapps 另需带 xz
+支持的 `tar`；Android 15 实验脚本还需 `p7zip`（`7z`）。
 
 下载会走 `curl`，脚本遵循标准的 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。
 
@@ -120,7 +120,8 @@ D=<IP>:5555
 adb -s $D shell dumpsys SurfaceFlinger | grep GLES
 #   应为 Mesa 26.x，不是 24.x
 adb -s $D shell getprop ro.hardware.gralloc      # minigbm_gbm_mesa
-adb -s $D shell getprop ro.hardware.vulkan       # intel
+adb -s $D shell getprop ro.hardware.vulkan       # intel / intel_hasvk / radeon（按 GPU）
+adb -s $D logcat -d -s gpu_config                # 开机时选了哪个节点和驱动
 # 以下仅 houdini-magisk 镜像：
 adb -s $D shell getprop ro.dalvik.vm.native.bridge  # libhoudini.so
 adb -s $D shell sha256sum /system/lib{,64}/libhoudini.so
@@ -143,7 +144,7 @@ adb -s $D shell dumpsys gpu | grep -E 'vkLoading|vkDriverLoadingTime|appPackageN
 
 - **宿主**：普通 Linux（Ubuntu/Debian/Arch 等），群晖等成品 NAS 固件通常不行
 - **内核**：binder（`binder_linux` 模块或内置 binderfs）
-- **GPU**：`/dev/dri/renderD128` 可用。默认打包 Intel 驱动，AMD/NVIDIA 见下
+- **GPU**：`/dev/dri/renderD*` 可用。Intel / AMD 开机自动识别，见下
 - **磁盘**：镜像约 2.5 GB
 
 没有 ashmem 的新内核要加 `androidboot.use_memfd=1`（多数情况都需要）。
@@ -158,24 +159,35 @@ adb -s $D shell dumpsys gpu | grep -E 'vkLoading|vkDriverLoadingTime|appPackageN
 
 在这台机器上验证通过：gralloc4 + Mesa 26 嫁接后 Vulkan 游戏正常渲染；
 **libhoudini ARM 翻译可以正常跑 ARM 手游**（含 32/64 位双 ABI）；
-Kitsune Magisk 与 MindTheGapps 叠加均正常。其他硬件理论上可行，
-`VULKAN_HW` / `VK_DRIVERS` 可调，但尚未实机验证。
+Kitsune Magisk 与 MindTheGapps 叠加均正常。其他 GPU 的选择逻辑有单元测试
+（`scripts/test-gpu-config.sh`），但尚未实机验证。
 
 ### GPU 支持
 
-默认镜像只打包 Intel Vulkan（`vulkan.intel` / `intel_hasvk`），并设置
-`ro.hardware.vulkan=intel`。`VULKAN_HW` 与 `VK_DRIVERS` 可一起覆盖，脚本会用
-`VULKAN_HW` 生成属性，避免“打包 AMD 驱动却仍加载 Intel”的不一致。
-实测环境见上文「实测机器」。
+镜像打包 Waydroid vendor 里全部 x86 PC 可用的 Mesa 26 Vulkan 驱动，
+**开机时由 `/vendor/bin/gpu_config.sh` 按 render node 的内核驱动自动选择**
+（替换了 redroid 原版脚本，见 [ARCHITECTURE](docs/ARCHITECTURE.md#gpu-属性开机探测)）：
+
+| 内核驱动 | 典型硬件 | `ro.hardware.vulkan` | 状态 |
+|---|---|---|---|
+| `xe` | Arc A/B 系列、Lunar Lake 之后 | `intel`（ANV） | **实测** |
+| `i915` Gen9+ | Skylake 之后核显、i915 上的 Arc | `intel`（ANV） | 未实机验证 |
+| `i915` Gen7/8 | Haswell / Broadwell 等 | `intel_hasvk` | 未实机验证 |
+| `amdgpu` | GCN / RDNA | `radeon`（RADV） | 未实机验证 |
+| `virtio_gpu` | 虚拟机里的 venus | `virtio` | 未实机验证 |
+| `nouveau` | NVIDIA | 不设（LOS20 vendor 不带 NVK），只有 GLES | — |
+| `nvidia` 闭源驱动 | NVIDIA | 不可用：Android 侧没有对应的用户态驱动 | — |
+
+- 多块 GPU 时取第一个可用节点；`androidboot.redroid_gpu_node=/dev/dri/renderD129` 指定。
+- 自动选择不对时，`androidboot.redroid_vulkan=intel_hasvk`（等）强制指定。
+- 只会选本镜像嫁接的 Mesa 26 驱动。原版 redroid 残留的 Mesa 24 驱动不认识 gralloc4
+  buffer，宁可不开 Vulkan 也不加载它（`logcat -s gpu_config` 会有告警）。
+- 只有 host 模式：`redroid_gpu_mode=guest/auto` 会按 host 处理并告警
+  （guest 依赖的 allocator@2.0 已停用）。
+- `VK_DRIVERS="vulkan.intel.so ..."` 可在构建时裁剪打包的驱动。旧的 `VULKAN_HW` 已废弃。
 
 构建时会对 `libgbm_mesa_wrapper.so` 打补丁，跳过 allocate 时的 `gbm_bo_map`
 探测（否则进系统设置会拖死 `allocator@4`）。详见 [TROUBLESHOOTING §7](docs/TROUBLESHOOTING.md)。
-
-> 曾改为打包全厂商驱动 + `detect_gpu.sh` 自动选；后来确认 Settings 崩与此无关，
-> 根因是 map_stride 探测。现保持 Intel-only 以减小面。
-
-AMD 示例：`VULKAN_HW=radeon VK_DRIVERS=vulkan.radeon.so ./scripts/gralloc4.sh`；
-NVIDIA/Nouveau 同理，但均尚未实机验证。
 
 ## Android 15（实验）
 
@@ -183,9 +195,9 @@ NVIDIA/Nouveau 同理，但均尚未实机验证。
 ./scripts/gralloc4-15.sh    # 产出 redroid15-graft:latest
 ```
 
-从 Waydroid LOS22 的 squashfs `vendor.img` 提取图形栈（Mesa 链
-`libLLVM21.so`，不是 13 上的 LLVM22）。houdini / Magisk / GApps
-尚未针对 15 完整验证。
+等价于 `ANDROID_VERSION=15 ./scripts/gralloc4.sh`：从 Waydroid LOS22 的 squashfs
+`vendor.img` 提取图形栈（`libLLVM21.so`，另带 NVK）。主线是 13——libhoudini /
+libndk_translation 的方案都针对 13；15 只保留图形层构建，不在维护范围。
 
 ## 仓库结构
 
@@ -195,8 +207,11 @@ docs/TROUBLESHOOTING.md           踩过的坑
 patches/kitsune-pid-set-dynamic.patch
                                   自编译 Kitsune 时修复 PID > 32768
 scripts/patch-houdini-expiry.py   严格校验并移除 Houdini 双 ABI 到期分支
-scripts/gralloc4.sh               redroid 13 图形栈（主路径）
-scripts/gralloc4-15.sh            redroid 15 图形栈（实验）
+scripts/gralloc4.sh               redroid 13 图形栈（主路径；ANDROID_VERSION=15 为实验）
+scripts/gralloc4-15.sh            等价于 ANDROID_VERSION=15 gralloc4.sh
+scripts/files/gpu_config.sh       替换 redroid 的 gpu_config.sh：开机按 GPU 选驱动
+scripts/test-gpu-config.sh        gpu_config.sh 的宿主机单元测试（不需要 GPU）
+scripts/check-vendor-closure.py   按链接器命名空间校验依赖闭包与符号
 scripts/build.sh                  叠 houdini + 可选 Magisk
 scripts/inject-gapps.sh           叠 MindTheGapps / LiteGapps
 scripts/inject-ndk.sh             叠 ChromeOS ndk_translation（勿叠 houdini）
@@ -262,9 +277,9 @@ NEW_IMAGE=myrepo/android:13 ./scripts/gralloc4.sh
 
 ## 已知限制
 
-- **只在「实测机器」一节列出的配置上完整验证过**。默认只打包 Intel Vulkan；
-  AMD/NVIDIA 需设置 `VULKAN_HW` / `VK_DRIVERS`（尚未实机验证）。
-- 镜像约 2.5 GB（主要是 Mesa 26 的 `libLLVM22` 64/32 位各一份）。
+- **只在「实测机器」一节列出的配置上完整验证过**。AMD 等其它 GPU 的自动选择
+  只有单元测试，尚未实机验证；NVIDIA 没有 Vulkan（见「GPU 支持」）。
+- 镜像约 2.5 GB（主要是 Mesa 26 的 `libLLVM22` 64/32 位各一份；多厂商 Vulkan 驱动另占约 50 MB）。
 - 基于 redroid 13。更高版本 redroid 的 vendor 分区布局相同，
   理论上改 `gralloc4.sh` 的 `BASE_IMAGE` 即可，但 houdini 的 linker 补丁需要对应版本
   （`rote66/redroid_libhoudini_hack` 提供 9.0 ~ 15.0）。

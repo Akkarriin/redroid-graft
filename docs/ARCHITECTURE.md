@@ -14,9 +14,10 @@ redroid/redroid:13.0.0-latest                官方基础镜像
 全部通过 `ADD xxx.tar /` 覆盖文件，不需要编译 AOSP。
 变体写在**镜像名**里，tag 统一用 `latest`。
 构建顺序：先 `gralloc4.sh`，再 `build.sh`，最后可选 `inject-gapps.sh`。
-`build.sh` 的 props 层只改 native bridge 相关键，会保留底图里的
-`ro.hardware.gralloc` / `ro.hardware.egl`；如果反过来叠，后写的整份
-`vendor/build.prop` 会把前一层冲掉。
+图形栈属性（`ro.hardware.gralloc/egl/vulkan`）不写在 `build.prop` 里，
+而是由嫁接版 `gpu_config.sh` 开机设置，所以后续层改 `build.prop` 不会冲掉它们。
+`build.sh` 的 props 层只改 native bridge 相关键，并以嫁接版 `gpu_config.sh`
+为标记确认底图是 `gralloc4.sh` 的产物。
 
 ---
 
@@ -85,9 +86,8 @@ vendor/etc/vintf/manifest/gbm_mesa.{allocator,mapper}@4.0.xml   声明 4.0
 vendor/etc/vintf/manifest.xml                                   删掉 2.0/2.1 声明
 vendor/etc/init/...allocator@4.0-service...rc                   启动 4.0
 vendor/etc/init/...allocator@2.0-service.rc                     加 disabled
-vendor/build.prop:  ro.hardware.gralloc=minigbm_gbm_mesa
-                    ro.hardware.egl=mesa
-                    ro.hardware.vulkan=intel
+vendor/bin/gpu_config.sh    替换原版：开机设置 ro.hardware.gralloc=minigbm_gbm_mesa、
+                            ro.hardware.egl=mesa，并按 GPU 选 ro.hardware.vulkan
 （构建时另：patch libgbm_mesa_wrapper.so，跳过 map_stride 探测）
 ```
 
@@ -118,28 +118,66 @@ SW buffer 已 `force_linear`，`map_stride == stride`。构建时由
 `scripts/patch-gbm-mesa-skip-map-stride.py` 改 `libgbm_mesa_wrapper.so`：
 跳过探测，直接 `out_map_stride = out_stride`。详见 TROUBLESHOOTING §7。
 
-### Vulkan 驱动范围（当前：Intel-only）
+### GPU 属性：开机探测
+
+redroid 原版有 `/vendor/bin/gpu_config.sh`，由 `redroid.common.rc` 在 `early-boot`
+执行（早于 allocator 和 SurfaceFlinger），按 `redroid_gpu_mode` 和 debugfs 里的 DRI
+驱动名 `setprop ro.hardware.{egl,gralloc,vulkan}`。
+
+旧做法把这三个属性写死进 `vendor/build.prop`。`ro.*` 先写者胜，于是原版脚本的
+setprop 全部静默失败：一个镜像只能对应一个厂商，guest/auto 模式也被架空。
+
+现在 `gralloc4.sh` 用 `scripts/files/gpu_config.sh` 替换原版（先校验原版 sha256，
+上游改了就停下来要求重新审阅），保留原有结构，改动：
+
+| | 原版 | 嫁接版 |
+|---|---|---|
+| gralloc | `gbm` | `minigbm_gbm_mesa` |
+| 内核驱动 | 只认 `i915` | 另认 `xe`（Arc） |
+| Intel Vulkan | 一律 `intel` | 读 `i915_capabilities`，Gen7/8 用 `intel_hasvk` |
+| `nouveau` | 不设 Vulkan | 映射到 NVK，但仅当镜像里有 Mesa 26 的 `vulkan.nouveau.so` |
+| 驱动白名单 | 无 | 只选嫁接的 Mesa 26 驱动；残留的 Mesa 24 驱动不认识 gralloc4 buffer |
+| 强制指定 | 无 | `androidboot.redroid_vulkan=<名字>` |
+| guest/auto | 软渲染 | 按 host 处理并告警（allocator@2.0 已停用） |
+| 日志 | echo 到 init 的 `/dev/null` | `logcat -s gpu_config` |
+
+`minigbm` 读 `gralloc.gbm.device` 选 render node（`strings` 可见
+"Using device %s as requested by gralloc.gbm.device"），所以原版的节点选择和
+`androidboot.redroid_gpu_node` 对 gralloc4 依然有效。
+
+`scripts/test-gpu-config.sh` 用 mksh（Android 的 `/system/bin/sh`）加
+`setprop/getprop` 桩和模拟的 debugfs 跑各类 GPU 组合，不需要 Android 或 GPU。
+
+### Vulkan 驱动范围
 
 | 组件 | 厂商相关？ |
 |---|---|
 | gralloc4 / minigbm | 否 |
-| `libgallium_dri.so` | **否** — megadriver，含 iris/xe 等 |
+| `libgallium_dri.so` | **否** — megadriver，含 iris/crocus/radeonsi/nouveau/virtio_gpu/llvmpipe |
 | `libLLVM22.so` / EGL / GLES | 否 |
 | `libdrm_{intel,amdgpu,radeon}.so` | 三个都已打包（供 Mesa 链接） |
 | `vulkan.*.so` | **是** — 分文件 |
 
-当前默认只搬 `vulkan.intel.so` / `vulkan.intel_hasvk.so`，并写入
-`ro.hardware.vulkan=intel`。可同时设置 `VULKAN_HW`、`VK_DRIVERS` 构建其它厂商；
-属性值由 `VULKAN_HW` 生成，不再与提取的驱动脱节。
+默认打包 vendor.img 里有的 `vulkan.{intel,intel_hasvk,radeon,nouveau,virtio}.so`
+（LOS20 没有 nouveau），64/32 位各一份，比只带 Intel 多约 50 MB。
+`VK_DRIVERS` 可裁剪；Android Vulkan loader 只加载 `ro.hardware.vulkan` 指定的那一个。
 
-曾打包全厂商 + `detect_gpu.sh` 自动选；后来发现 Settings 崩与此无关
-（Intel-only 一样崩），根因是上一节的 map 探测。为减小面，默认仍是 Intel-only。
-AMD/NVIDIA 尚未实机验证。
+曾打包全厂商 + 自写 `detect_gpu.sh`，在 Settings 崩溃（实为 map 探测，见上节）时
+被误判而撤回。现在复用 redroid 自己的探测脚本，不另起一套。
 
-### 依赖闭包
+### 依赖闭包与符号
 
-脚本末尾会做一次校验：遍历所有新增 `.so` 的 `DT_NEEDED`，
-确认每个依赖要么在本层、要么基础镜像已有。这个检查抓到过 `libLLVM22.so` 的缺失。
+`scripts/check-vendor-closure.py` 按 Android 链接器命名空间解析每个新增 ELF：
+
+- 库按 **sphal**（EGL/GLES/Vulkan/mapper 在 system 进程里被 dlopen）：
+  只能看到 `/vendor/${LIB}`、`/odm/${LIB}`、VNDK-SP、LLNDK
+- `/vendor/bin` 下的服务按 **vendor**：再加 VNDK-core
+- 每个依赖必须是正确的位数/架构，且本层库的强未定义符号必须在闭包内有定义
+
+VNDK/LLNDK 列表取自基础镜像（13：VNDK apex；15：`system/etc/llndk.libraries.txt`，
+apex 未展开时自动解包）。旧检查只看文件名是否在 `system/` 或 `vendor/` 下存在：
+它抓到过 `libLLVM22.so` 缺失，但对"文件在 `/system/lib64`、vendor 命名空间却看不到"
+无能为力——15 上 `libdmabufheap.so` 就是这种情况，新检查能直接报出来。
 
 ---
 
@@ -266,8 +304,8 @@ ro.system.product.cpu.abilist = x86_64,x86,arm64-v8a,armeabi-v7a,armeabi
 ```
 
 Android 启动后会由这些分区属性汇总出通用 `ro.product.cpu.abilist`。
-模板取自上一层（已含 gralloc4 的 `redroid13-graft`），**只改写上述键**，
-不会冲掉 `ro.hardware.gralloc` / `ro.hardware.egl`。
+模板取自上一层（已含 gralloc4 的 `redroid13-graft`），**只改写上述键**。
+图形栈属性不在 `build.prop` 里，不受影响。
 
 ---
 
@@ -300,14 +338,14 @@ Play 商店首次使用通常还要到 Google 登记设备的 GSF `android_id`
 后层的同名文件会**整文件**覆盖前层。因此：
 
 1. 必须先 `gralloc4.sh` 再 `build.sh`，最后可选 `inject-gapps.sh`
-2. `build.sh` 改 `vendor/build.prop` 时模板必须来自 gralloc4 底图，
+2. `build.sh` 改 `vendor/build.prop` 时模板必须来自直接上一层，
    且只 patch native bridge 相关键（脚本已如此）
 3. `inject-gapps.sh` 若改 `system/build.prop`（跳过向导），模板取自
    houdini-magisk 底图，只追加 `ro.setupwizard.mode`，不动其它键
 
 若把顺序反了，或后层用原版 redroid 的整份 `build.prop` 覆盖，
-会把 `libhoudini.so` 冲回 `libnb.so`，或把 gralloc 属性冲掉。
-详见 TROUBLESHOOTING.md #6。
+会把 `libhoudini.so` 冲回 `libnb.so`。详见 TROUBLESHOOTING.md #6。
+（图形栈属性已移到 `gpu_config.sh`，不再有被冲掉的风险。）
 
 ---
 
@@ -324,13 +362,16 @@ Play 商店首次使用通常还要到 Google 登记设备的 GSF `android_id`
 
 ---
 
-## Android 15：gralloc4-15.sh（实验）
+## Android 15：gralloc4-15.sh（实验，不在维护范围）
 
-与 13 的差异：
+主线是 13：libhoudini / libndk_translation 的方案都针对 13。
+`gralloc4-15.sh` 等价于 `ANDROID_VERSION=15 ./scripts/gralloc4.sh`，与 13 共用同一份脚本，
+差异只在配置块里：
 
-- vendor.img 是 squashfs，用 `7z` 提取，不用 `debugfs`
-- Mesa 链 `libLLVM21.so`（LOS20/23 是 LLVM22）
-- 额外搬 `libdmabufheap.so`（allocator/mapper@4 硬依赖）
+- vendor.img 是 squashfs，用 `7z` 提取（按文件头自动判断）
+- Mesa 链 `libLLVM21.so`（版本号从 `libgallium_dri.so` 的 `DT_NEEDED` 读出）
+- 额外搬 `libdmabufheap.so`：15 没有 VNDK，`/system/lib64` 里那份 vendor 命名空间看不到
 - 默认底图 `redroid/redroid:15.0.0-latest`，产出 `redroid15-graft:latest`
+- LOS22 带 `vulkan.nouveau.so`（NVK），NVIDIA + nouveau 可以有 Vulkan
 
-map_stride 补丁覆盖 LOS22 的 wrapper。houdini / Magisk 层尚未针对 15 完整验证。
+houdini / Magisk 层没有针对 15 验证。

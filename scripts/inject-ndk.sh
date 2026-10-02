@@ -3,7 +3,7 @@
 # 配方对齐 waydroid-helper/extensions 的 ndk_translation-chromeos_zork R136
 #
 # 已知坑（本脚本已避开）:
-# 1. 只 patch native-bridge 相关 prop，保留 gralloc4/vulkan/egl
+# 1. 只 patch native-bridge 相关 prop（图形栈属性由嫁接版 gpu_config.sh 开机设置）
 # 2. redroid 的 init `copy` 写 /proc/sys/fs/binfmt_misc/register 常失败
 #    → 改用 exec+cat（与 houdini.rc 同思路）
 # 3. 勿叠在已注入 houdini 的镜像上（binfmt/桥会打架）；默认底图是 redroid13-graft
@@ -120,7 +120,7 @@ echo "# disabled: using libndk_translation" > "$SRC/layer/system/etc/init/houdin
 chmod 0644 "$SRC/layer/system/etc/init/houdini.rc"
 
 # 属性: 对齐 wh-extensions prop.json，但只改 bridge 相关键
-msg "patch build.prop（保留图形栈属性）"
+msg "patch build.prop（只改 native bridge 相关键）"
 mkdir -p "$SRC/layer/vendor" "$SRC/layer/system"
 copy_from_base /vendor/build.prop "$SRC/layer/vendor/build.prop"
 copy_from_base /system/build.prop "$SRC/layer/system/build.prop"
